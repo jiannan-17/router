@@ -15,7 +15,7 @@ use parking_lot::{Condvar, Mutex};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use vllm_router_rs::tokenizer::{
     mock::MockTokenizer, traits::Encoder, CachedTokenizer, TokenizerCacheConfig,
 };
@@ -28,9 +28,14 @@ const BYTES: &str = "vllm_tokenizer_cache_bytes";
 #[derive(Default)]
 struct Captured {
     values: Mutex<HashMap<String, f64>>,
+    /// Notified whenever a gauge value is stored in `values`.
+    stored_signal: Condvar,
     /// When set, the next gauge `set` call takes this flag and blocks until
     /// `release`. Later calls are unaffected.
     block_next_set: Mutex<bool>,
+    /// Set by the blocked `set` call once it is waiting on `release`.
+    blocked: Mutex<bool>,
+    blocked_signal: Condvar,
     released: Mutex<bool>,
     release_signal: Condvar,
 }
@@ -47,6 +52,31 @@ impl Captured {
     /// Make the next gauge `set` block until `release` is called.
     fn block_next_set(&self) {
         *self.block_next_set.lock() = true;
+    }
+
+    /// Wait until the blocked `set` call is parked on `release`.
+    fn wait_until_blocked(&self) {
+        let mut blocked = self.blocked.lock();
+        while !*blocked {
+            self.blocked_signal.wait(&mut blocked);
+        }
+    }
+
+    /// Wait until any gauge value has been stored, giving up at `timeout`.
+    /// Returns whether one was stored.
+    fn wait_for_store(&self, timeout: Duration) -> bool {
+        let deadline = Instant::now() + timeout;
+        let mut values = self.values.lock();
+        while values.is_empty() {
+            if self
+                .stored_signal
+                .wait_until(&mut values, deadline)
+                .timed_out()
+            {
+                break;
+            }
+        }
+        !values.is_empty()
     }
 
     fn release(&self) {
@@ -82,12 +112,16 @@ impl GaugeFn for CapturingGauge {
     fn set(&self, value: f64) {
         let blocked = std::mem::take(&mut *self.captured.block_next_set.lock());
         if blocked {
+            *self.captured.blocked.lock() = true;
+            self.captured.blocked_signal.notify_all();
             let mut released = self.captured.released.lock();
             while !*released {
                 self.captured.release_signal.wait(&mut released);
             }
         }
-        self.captured.values.lock().insert(self.name.clone(), value);
+        let mut values = self.captured.values.lock();
+        values.insert(self.name.clone(), value);
+        self.captured.stored_signal.notify_all();
     }
 }
 
@@ -207,6 +241,14 @@ fn eviction_and_replacement_keep_gauges_exact() {
 /// `set` is blocked, so the second operation publishes freely; that is
 /// exactly the interleaving that left a stale value when publication was
 /// not ordered with the state change.
+///
+/// The recorder reports when the insert's publication is parked, so the
+/// clear always starts while that publication is in flight. It then waits
+/// on the cache lock, and its own publication on the occupancy lock, so
+/// nothing reaches the recorder before `release`; only an implementation
+/// that orders neither lets the clear's gauges land early and be
+/// overwritten. `publication_holds_the_cache_lock` in `cache.rs` checks the
+/// cache lock directly.
 #[test]
 fn delayed_publish_cannot_overwrite_a_later_clear() {
     let _serial = SERIAL.lock();
@@ -221,17 +263,24 @@ fn delayed_publish_cannot_overwrite_a_later_clear() {
             metrics::with_local_recorder(&*recorder, || shared.encode("Hello").unwrap());
         })
     };
-    // Let the insert reach the recorder and stall there.
-    thread::sleep(Duration::from_millis(50));
+    // The insert now holds the cache lock with its publication stalled.
+    captured.wait_until_blocked();
+
     let clearer = {
         let (recorder, shared) = (recorder.clone(), shared.clone());
         thread::spawn(move || metrics::with_local_recorder(&*recorder, || shared.clear()))
     };
-    thread::sleep(Duration::from_millis(50));
+    // Nothing can reach the recorder before `release` (see above), so this
+    // wait only bounds the test.
+    let cleared_early = captured.wait_for_store(Duration::from_millis(500));
     captured.release();
     inserter.join().unwrap();
     clearer.join().unwrap();
 
+    assert!(
+        !cleared_early,
+        "clear published while an insert's publication was stalled"
+    );
     let stats = shared.stats();
     assert_eq!(
         captured.gauges(),
@@ -240,6 +289,55 @@ fn delayed_publish_cannot_overwrite_a_later_clear() {
     );
 
     metrics::with_local_recorder(&*recorder, || drop(shared));
+    assert_eq!(captured.gauges(), (0.0, 0.0));
+}
+
+/// The occupancy lock orders publications across instances: while one
+/// cache's publication is stalled, another cache's publication queues
+/// behind it instead of landing first and being overwritten by the stale
+/// total.
+#[test]
+fn delayed_publish_cannot_overwrite_another_instance() {
+    let _serial = SERIAL.lock();
+    let captured = Arc::new(Captured::default());
+    let recorder = Arc::new(CapturingRecorder(captured.clone()));
+    let a = Arc::new(cache(10));
+    let b = Arc::new(cache(10));
+
+    captured.block_next_set();
+    let first = {
+        let (recorder, a) = (recorder.clone(), a.clone());
+        thread::spawn(move || {
+            metrics::with_local_recorder(&*recorder, || a.encode("Hello").unwrap());
+        })
+    };
+    captured.wait_until_blocked();
+
+    let second = {
+        let (recorder, b) = (recorder.clone(), b.clone());
+        thread::spawn(move || {
+            metrics::with_local_recorder(&*recorder, || b.encode("world").unwrap());
+        })
+    };
+    // With `set` under the occupancy lock the second publication waits for
+    // the stalled one, so this wait only bounds the test. A `set` outside
+    // that lock would store the second total here, and the stalled first
+    // publication would then overwrite it.
+    let published_early = captured.wait_for_store(Duration::from_millis(500));
+    captured.release();
+    first.join().unwrap();
+    second.join().unwrap();
+
+    assert!(
+        !published_early,
+        "a publication overtook one that was stalled"
+    );
+    assert_eq!(captured.gauges(), expected(&[&a, &b]));
+
+    metrics::with_local_recorder(&*recorder, || {
+        drop(a);
+        drop(b);
+    });
     assert_eq!(captured.gauges(), (0.0, 0.0));
 }
 

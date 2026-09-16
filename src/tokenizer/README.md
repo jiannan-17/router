@@ -923,7 +923,7 @@ The `Encoding` enum must:
 - `tiktoken.rs`: 7 tests - Model detection, encode/decode roundtrip
 - `chat_template.rs`: 3 tests - Template rendering, loading
 - `tests.rs`: 9 tests - Cross-module integration
-- `cache.rs`: 19 tests - Hit/miss, eviction by count and bytes, oversized bypass, batch bypass, concurrency, byte estimates
+- `cache.rs`: 20 tests - Hit/miss, eviction by count and bytes, oversized bypass, batch bypass, concurrency, gauge publication under the cache lock, byte estimates
 
 **Integration Tests (10 tests in tokenizer_integration.rs):**
 - HuggingFace tokenizer hash verification
@@ -946,8 +946,8 @@ The `Encoding` enum must:
 - Concurrent access with eviction
 - `#[ignore]` TinyLlama repeat of the comparison plus the hash fixtures (`cargo test --test tokenizer_cache_integration -- --ignored`)
 
-**Cache Metrics Tests (4 tests in tokenizer_cache_metrics.rs):**
-- Capturing `metrics::Recorder` checks the occupancy gauges sum over live instances, follow eviction, `clear()` and `Drop`, and stay consistent under concurrent inserts and clears, including a delayed publication that must not overwrite a later clear
+**Cache Metrics Tests (5 tests in tokenizer_cache_metrics.rs):**
+- Capturing `metrics::Recorder` checks the occupancy gauges sum over live instances, follow eviction, `clear()` and `Drop`, and stay consistent under concurrent inserts and clears, including a stalled publication that must not be overtaken by a later clear or by another instance's publication
 
 ### Benchmark Suite (tokenizer_benchmark.rs)
 

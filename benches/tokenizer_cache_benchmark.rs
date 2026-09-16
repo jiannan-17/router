@@ -76,8 +76,8 @@ fn generate_system_prompt(size: usize) -> String {
 fn prompts() -> Vec<(&'static str, String)> {
     vec![
         ("short_30B", SHORT_PROMPT.to_string()),
-        ("medium_230B", MEDIUM_PROMPT.to_string()),
-        ("long_670B", LONG_PROMPT.to_string()),
+        ("medium_201B", MEDIUM_PROMPT.to_string()),
+        ("long_638B", LONG_PROMPT.to_string()),
         ("system_4KB", generate_system_prompt(4000)),
         ("system_16KB", generate_system_prompt(16000)),
     ]

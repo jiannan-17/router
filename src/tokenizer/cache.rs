@@ -16,6 +16,9 @@
 //! - Tokenization runs outside the cache lock. Two concurrent misses on the
 //!   same input both tokenize; the later insert replaces the earlier one with
 //!   an identical value.
+//! - Entries removed by eviction, replacement or [`CachedTokenizer::clear`]
+//!   are freed after the lock is released, so deallocating a large encoding
+//!   does not stall concurrent lookups.
 //!
 //! # Preconditions
 //!
@@ -256,13 +259,19 @@ impl CachedTokenizer {
 
     /// Drop every entry. Counters are kept.
     pub fn clear(&self) {
-        let mut guard = self.state.lock();
-        let state = &mut *guard;
-        let entries = state.lru.len();
-        let bytes = state.bytes;
-        state.lru.clear();
-        state.bytes = 0;
-        publish_occupancy_delta(-(entries as isize), -(bytes as isize));
+        let removed = {
+            let mut guard = self.state.lock();
+            let state = &mut *guard;
+            let entries = state.lru.len();
+            let bytes = state.bytes;
+            let capacity = state.lru.cap();
+            let removed = std::mem::replace(&mut state.lru, LruCache::sparse(capacity));
+            state.bytes = 0;
+            publish_occupancy_delta(-(entries as isize), -(bytes as isize));
+            removed
+        };
+        // Free the entries outside the lock; see the module documentation.
+        drop(removed);
     }
 
     fn lookup(&self, input: &str) -> Option<Arc<Encoding>> {
@@ -275,6 +284,9 @@ impl CachedTokenizer {
 
     fn insert(&self, input: &str, encoding: Arc<Encoding>, bytes: usize) {
         let mut evicted: u64 = 0;
+        // Entries removed under the lock are freed after it is released; see
+        // the module documentation. Allocates only when something is removed.
+        let mut removed: Vec<(String, CacheEntry)> = Vec::new();
         {
             let mut guard = self.state.lock();
             let state = &mut *guard;
@@ -291,6 +303,7 @@ impl CachedTokenizer {
                 if old_key != input {
                     evicted += 1;
                 }
+                removed.push((old_key, old_entry));
             }
             state.bytes += bytes;
 
@@ -298,9 +311,10 @@ impl CachedTokenizer {
             // loop never reaches the entry just inserted (the MRU).
             while state.bytes > self.config.max_bytes {
                 match state.lru.pop_lru() {
-                    Some((_, victim)) => {
-                        state.bytes -= victim.bytes;
+                    Some(victim) => {
+                        state.bytes -= victim.1.bytes;
                         evicted += 1;
+                        removed.push(victim);
                     }
                     None => break,
                 }
@@ -311,6 +325,7 @@ impl CachedTokenizer {
                 state.bytes as isize - bytes_before as isize,
             );
         }
+        drop(removed);
 
         if evicted > 0 {
             self.evictions.fetch_add(evicted, Ordering::Relaxed);
@@ -445,6 +460,10 @@ mod tests {
     use super::*;
     use crate::tokenizer::mock::MockTokenizer;
     use crate::tokenizer::Tokenizer;
+    use metrics::{
+        Counter, Gauge, GaugeFn, Histogram, Key, KeyName, Metadata, Recorder, SharedString, Unit,
+    };
+    use parking_lot::Condvar;
     use std::sync::atomic::AtomicUsize;
     use std::thread;
 
@@ -826,6 +845,101 @@ mod tests {
 
         cache.encode("Hello").unwrap();
         assert_eq!(inner.encode_calls(), 2);
+    }
+
+    #[derive(Default)]
+    struct GateState {
+        parked: bool,
+        released: bool,
+    }
+
+    /// Parks the first gauge `set` until `release`, so a test can inspect the
+    /// cache while a publication is in flight.
+    #[derive(Default)]
+    struct Gate {
+        state: Mutex<GateState>,
+        changed: Condvar,
+    }
+
+    impl Gate {
+        fn wait_until_parked(&self) {
+            let mut state = self.state.lock();
+            while !state.parked {
+                self.changed.wait(&mut state);
+            }
+        }
+
+        fn release(&self) {
+            self.state.lock().released = true;
+            self.changed.notify_all();
+        }
+    }
+
+    struct ParkingGauge(Arc<Gate>);
+
+    impl GaugeFn for ParkingGauge {
+        fn increment(&self, _: f64) {}
+        fn decrement(&self, _: f64) {}
+        fn set(&self, _: f64) {
+            let mut state = self.0.state.lock();
+            if state.released {
+                return;
+            }
+            state.parked = true;
+            self.0.changed.notify_all();
+            while !state.released {
+                self.0.changed.wait(&mut state);
+            }
+        }
+    }
+
+    struct ParkingRecorder(Arc<Gate>);
+
+    impl Recorder for ParkingRecorder {
+        fn describe_counter(&self, _: KeyName, _: Option<Unit>, _: SharedString) {}
+        fn describe_gauge(&self, _: KeyName, _: Option<Unit>, _: SharedString) {}
+        fn describe_histogram(&self, _: KeyName, _: Option<Unit>, _: SharedString) {}
+
+        fn register_counter(&self, _: &Key, _: &Metadata<'_>) -> Counter {
+            Counter::noop()
+        }
+
+        fn register_gauge(&self, _: &Key, _: &Metadata<'_>) -> Gauge {
+            Gauge::from_arc(Arc::new(ParkingGauge(self.0.clone())))
+        }
+
+        fn register_histogram(&self, _: &Key, _: &Metadata<'_>) -> Histogram {
+            Histogram::noop()
+        }
+    }
+
+    /// Gauges are published while the cache lock is held, so a state change
+    /// that starts during a publication cannot overtake it.
+    #[test]
+    fn publication_holds_the_cache_lock() {
+        let gate = Arc::new(Gate::default());
+        let inner = CountingTokenizer::new();
+        let cache = Arc::new(cached(&inner, TokenizerCacheConfig::default()));
+
+        let inserter = {
+            let (gate, cache) = (gate.clone(), cache.clone());
+            thread::spawn(move || {
+                metrics::with_local_recorder(&ParkingRecorder(gate), || {
+                    cache.encode("Hello").unwrap()
+                })
+            })
+        };
+        gate.wait_until_parked();
+        // Release before asserting: a parked inserter holds the occupancy
+        // lock, and a failed assertion here would leave it parked for good.
+        let locked = cache.state.try_lock().is_none();
+        gate.release();
+        inserter.join().unwrap();
+        assert!(
+            locked,
+            "cache lock released before the gauges were published"
+        );
+        assert_eq!(cache.len(), 1);
     }
 
     #[test]
