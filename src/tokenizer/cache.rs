@@ -591,7 +591,7 @@ mod tests {
             "Hello",
             "hello",
             "Hello ",
-            "caf\u{e9}",
+            "café",
             "cafe\u{301}",
             "\u{1f600}",
         ] {
@@ -600,7 +600,7 @@ mod tests {
         assert_eq!(inner.encode_calls(), 6);
         assert_eq!(cache.stats().entries, 6);
 
-        cache.encode("caf\u{e9}").unwrap();
+        cache.encode("café").unwrap();
         assert_eq!(inner.encode_calls(), 6);
         assert_eq!(cache.stats().hits, 1);
     }

@@ -32,7 +32,7 @@ const PROMPTS: &[&str] = &[
     "<s> wrapped in special tokens </s>",
     "<unk> unknown and <s><s> repeated markers",
     "tabs\tand\nnewlines  and  double  spaces",
-    "na\u{ef}ve caf\u{e9} \u{2014} accents and dashes",
+    "na\u{ef}ve café \u{2014} accents and dashes",
     "\u{1f600}\u{1f603}\u{1f604}\u{1f601}\u{1f606} emoji \u{1f92a}\u{1f47b}",
     "\u{4f60}\u{597d}\u{ff0c}\u{4e16}\u{754c} CJK text",
     "Lorem ipsum dolor sit amet, consectetur adipiscing elit, sed do eiusmod tempor \
