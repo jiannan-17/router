@@ -7,14 +7,11 @@ mod common;
 
 use common::bench_corpus::{
     chat, chat_with_session, completion_ids, completion_text, to_chat_request,
-    to_completion_request, Corpus, CorpusKind, HOT_SET_SIZE, SHORT_SHARED_PREFIX_MAX_BYTES, SIZES,
+    to_completion_request, Corpus, CorpusKind, HOT_SET_SIZE, LONG_SHARED_PREFIX_TAIL_BYTES,
+    SHORT_SHARED_PREFIX_MAX_BYTES, SIZES,
 };
 use common::bench_mock::BenchMockWorker;
-use vllm_router_rs::protocols::spec::GenerationRequest;
-use vllm_router_rs::tokenizer::huggingface::HuggingFaceTokenizer;
-use vllm_router_rs::tokenizer::traits::Encoder;
-
-const FIXTURE: &str = "tests/fixtures/tokenizer/byte_level_bpe.json";
+use vllm_router_rs::protocols::spec::{GenerationRequest, PromptInput};
 
 #[test]
 fn every_corpus_builds_prompts_of_the_requested_size() {
@@ -58,6 +55,20 @@ fn hot64_cycles_and_cold_never_repeats() {
 }
 
 #[test]
+fn non_shared_text_is_not_one_repeated_body() {
+    // Consecutive cold prompts must differ after their unique markers too,
+    // not only in the marker; see the module docs of bench_corpus.
+    for size in SIZES {
+        let corpus = Corpus::new(CorpusKind::Cold, size);
+        let skip = 16;
+        assert_ne!(&corpus.prompt(1)[skip..], &corpus.prompt(2)[skip..]);
+        let tails = Corpus::new(CorpusKind::ShortSharedPrefix, size);
+        let cut = tails.shared_prefix().len() + 16;
+        assert_ne!(&tails.prompt(1)[cut..], &tails.prompt(2)[cut..]);
+    }
+}
+
+#[test]
 fn mixed90_is_ten_percent_cold() {
     let corpus = Corpus::new(CorpusKind::Mixed90, 2048);
     let hot = Corpus::new(CorpusKind::Hot64, 2048);
@@ -83,6 +94,20 @@ fn short_shared_prefix_shares_a_bounded_prefix() {
 }
 
 #[test]
+fn long_shared_prefix_shares_everything_but_the_tail() {
+    for size in SIZES {
+        let corpus = Corpus::new(CorpusKind::LongSharedPrefix, size);
+        let prefix = corpus.shared_prefix();
+        assert_eq!(prefix.len(), size - LONG_SHARED_PREFIX_TAIL_BYTES);
+        let a = corpus.prompt(1);
+        let b = corpus.prompt(2);
+        assert!(a.starts_with(prefix) && b.starts_with(prefix));
+        assert_ne!(a, b);
+        assert_eq!(a.len(), size);
+    }
+}
+
+#[test]
 fn builders_produce_typed_requests_with_expected_routing_text() {
     let corpus = Corpus::new(CorpusKind::Hot64, 200);
     let prompt = corpus.prompt(0);
@@ -90,18 +115,14 @@ fn builders_produce_typed_requests_with_expected_routing_text() {
     let completion = to_completion_request(&completion_text(&prompt));
     assert_eq!(completion.extract_text_for_routing(), prompt);
 
-    let tokenizer = HuggingFaceTokenizer::from_file(FIXTURE).expect("fixture tokenizer");
-    let ids: Vec<u32> = tokenizer
-        .encode(&prompt)
-        .expect("encode")
-        .token_ids()
-        .to_vec();
-    assert!(!ids.is_empty());
-    let by_ids = to_completion_request(&completion_ids(&ids));
-    assert_eq!(
-        by_ids.extract_text_for_routing(),
-        format!("token_ids:{}", ids.len())
-    );
+    // Pre-tokenized prompts must deserialize as a single id sequence. The
+    // routing text derived from them is deliberately not pinned here: its
+    // format is under discussion (PR #237) and is not what this corpus tests.
+    let by_ids = to_completion_request(&completion_ids(&[1, 2, 3]));
+    assert!(matches!(by_ids.prompt, PromptInput::IntArray(ref ids) if ids == &[1, 2, 3]));
+    let key = by_ids.extract_text_for_routing();
+    assert!(!key.is_empty());
+    assert_ne!(key, prompt);
 
     let chat_req = to_chat_request(&chat(Some("system"), &prompt));
     assert_eq!(chat_req.extract_text_for_routing(), "");

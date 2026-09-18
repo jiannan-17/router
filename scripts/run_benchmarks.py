@@ -115,7 +115,8 @@ class BenchmarkRunner:
         if result.returncode != 0:
             print("Router overhead harness failed!")
             sys.exit(1)
-        print("Results: target/router_overhead/summary.md and summary.json")
+        out_dir = os.environ.get("VLLM_ROUTER_BENCH_OUT_DIR", "target/router_overhead")
+        print(f"Results: {out_dir}/summary.md and {out_dir}/summary.json")
 
     def _save_baseline(self, filename: str, output: str):
         """Save benchmark results to a file as baseline."""
@@ -254,6 +255,26 @@ def main():
 
     # Build in release mode
     runner.build_release()
+
+    only_request_processing = [
+        name
+        for name, used in (
+            ("--quick", args.quick),
+            ("--save-baseline", args.save_baseline),
+            ("--compare-baseline", args.compare_baseline),
+            ("--validate-thresholds", args.validate_thresholds),
+            ("--save-results", args.save_results),
+        )
+        if used
+    ]
+    if only_request_processing and (
+        args.router_overhead or args.bench != "request_processing"
+    ):
+        print(
+            "Note: "
+            + ", ".join(only_request_processing)
+            + " only apply to --bench request_processing and are ignored here."
+        )
 
     if args.router_overhead:
         runner.run_router_overhead()
