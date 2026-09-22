@@ -19,12 +19,15 @@ keeps the corpus and the bench mock worker building and deterministic in CI.
   no state, so no row here shows a routing **benefit** (KV-cache hits,
   time to first token). That needs real workers with prefix caching on.
 - Client-observed latency includes the client, the loopback network and the
-  mock worker. The `direct_mock` scenario drives a mock worker with no
-  router in the path and is the floor to read the other rows against.
+  mock worker. The `direct_completions` and `direct_chat` scenarios drive a
+  mock worker with no router in the path and are the floor to read the other
+  rows against. Each routed row is read against the direct row for its own
+  route: a chat request and its response are not the same work as a
+  completion one, so the two floors differ.
 - Means subtract; percentiles do not. The table reports
-  `mean - direct_mock mean`, and lists the router and direct percentiles
-  side by side. A "router P99" obtained by subtracting two P99 values is
-  not a meaningful quantity and is not printed.
+  `mean - direct mean` on the same route, and lists the router and direct
+  percentiles side by side. A "router P99" obtained by subtracting two P99
+  values is not a meaningful quantity and is not printed.
 - Router CPU and RSS are per process, read with `wait4(2)` for the router
   child only, after it has been stopped. `ru_maxrss` is bytes on macOS and
   kibibytes on Linux; the harness normalizes to bytes. `router cpu ms/1k
@@ -41,8 +44,8 @@ keeps the corpus and the bench mock worker building and deterministic in CI.
 - The client and the mock workers run on one 8-thread runtime inside the
   harness; the router is a separate process with its default thread count.
   On a machine without that many spare cores, router rows include CPU
-  contention the `direct_mock` row does not. The report records both thread
-  counts and the harness's own CPU per cell.
+  contention the direct rows do not. The report records both thread counts
+  and the harness's own CPU per cell.
 - `hotspot` is the largest worker's share of the generation requests
   divided by the even share `1 / workers`: `1.0` is a perfectly even
   spread, `workers` means every request landed on one worker. It shows
@@ -72,8 +75,8 @@ whether the whole change is worth it. D faster than C but slower than A or
 B only shows that the cache offsets a cost the change introduced.
 
 Today the harness ships arm A (`completions_off`, `completions_rendezvous`,
-`chat_off`) and the floor (`direct_mock`); arms B to D are added by the
-change under evaluation.
+`chat_off`) and the floors (`direct_completions`, `direct_chat`); arms B to
+D are added by the change under evaluation.
 
 ## Corpus
 
@@ -125,7 +128,8 @@ Scenarios:
 
 | Scenario | Router policy | Route |
 |---|---|---|
-| `direct_mock` | none (client to mock worker) | `/v1/completions` |
+| `direct_completions` | none (client to mock worker) | `/v1/completions` |
+| `direct_chat` | none (client to mock worker) | `/v1/chat/completions` |
 | `completions_off` | `cache_aware` (default) | `/v1/completions` |
 | `completions_rendezvous` | `rendezvous_hash` | `/v1/completions` |
 | `chat_off` | `cache_aware` | `/v1/chat/completions` |
@@ -143,7 +147,7 @@ Knobs (environment variables): `VLLM_ROUTER_BENCH_SCENARIOS`,
 smoke:
 
 ```text
-VLLM_ROUTER_BENCH_SCENARIOS=direct_mock,completions_off \
+VLLM_ROUTER_BENCH_SCENARIOS=direct_completions,completions_off \
 VLLM_ROUTER_BENCH_SIZES=2048 VLLM_ROUTER_BENCH_CONCURRENCY=4 \
 VLLM_ROUTER_BENCH_WARMUP_SECS=1 VLLM_ROUTER_BENCH_MEASURE_SECS=3 \
 cargo test --release --test router_overhead_bench -- --ignored --nocapture
@@ -179,6 +183,6 @@ corpus seed: 0x244   warmup/measure: <w> s / <m> s   workers: 4   repeats: <n>  
 ```
 
 When comparing a change against `main`, run both on the same machine in
-the same session with nothing else running, keep `direct_mock` in both
-runs, use at least three repeats, and treat differences inside the
+the same session with nothing else running, keep the direct scenarios in
+both runs, use at least three repeats, and treat differences inside the
 reported spread as no change.

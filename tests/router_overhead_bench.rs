@@ -6,9 +6,10 @@
 //! answer instantly. A client drives the router, and the harness reports
 //! client-observed latency, throughput, how the requests spread across the
 //! workers, and the router process's own CPU time and peak RSS, taken per
-//! process with `wait4(2)` after the process is stopped. The `direct_mock`
-//! scenario drives a mock worker without a router and is the floor every
-//! other row is read against.
+//! process with `wait4(2)` after the process is stopped. The `direct_*`
+//! scenarios drive a mock worker without a router; each routed row is read
+//! against the direct row for its own route, since the request and response
+//! bodies differ between `/v1/completions` and `/v1/chat/completions`.
 //!
 //! Numbers from this harness describe router cost only. Nothing here can
 //! show a routing *benefit* (KV-cache hits, time to first token); that needs
@@ -17,7 +18,7 @@
 //! The client and the mock workers share one 8-thread runtime in this
 //! process; the router runs as a separate process with its default thread
 //! count. On a machine with fewer spare cores than that, router rows include
-//! CPU contention the `direct_mock` row does not have; the report records
+//! CPU contention the direct rows do not have; the report records
 //! the thread counts and the CPU this process used per cell so it is visible.
 //!
 //! Ignored by default. Run with:
@@ -27,8 +28,10 @@
 //! ```
 //!
 //! Knobs (environment variables, all optional):
-//! - `VLLM_ROUTER_BENCH_SCENARIOS`: comma list of `direct_mock`,
-//!   `completions_off`, `completions_rendezvous`, `chat_off` (default: all)
+//! - `VLLM_ROUTER_BENCH_SCENARIOS`: comma list of `direct_completions`,
+//!   `direct_chat`, `completions_off`, `completions_rendezvous`, `chat_off`
+//!   (default: all). A routed scenario reports no delta unless the direct
+//!   scenario on its route runs too.
 //! - `VLLM_ROUTER_BENCH_SIZES`: prompt bytes, default `200,2048,16384`
 //! - `VLLM_ROUTER_BENCH_CORPORA`: `hot64,cold,mixed90,short_shared_prefix,
 //!   long_shared_prefix`, default `hot64,cold`
@@ -104,11 +107,16 @@ struct Scenario {
     route: Route,
 }
 
-const SCENARIOS: [Scenario; 4] = [
+const SCENARIOS: [Scenario; 5] = [
     Scenario {
-        name: "direct_mock",
+        name: "direct_completions",
         policy: None,
         route: Route::Completions,
+    },
+    Scenario {
+        name: "direct_chat",
+        policy: None,
+        route: Route::Chat,
     },
     Scenario {
         name: "completions_off",
@@ -185,6 +193,14 @@ impl Config {
             router_cpus.is_none() || cfg!(target_os = "linux"),
             "VLLM_ROUTER_BENCH_ROUTER_CPUS needs Linux `taskset`"
         );
+        let concurrency: Vec<usize> = env_list("VLLM_ROUTER_BENCH_CONCURRENCY", "1,64")
+            .iter()
+            .map(|c| c.parse().expect("concurrency"))
+            .collect();
+        assert!(
+            concurrency.iter().all(|&c| c > 0),
+            "VLLM_ROUTER_BENCH_CONCURRENCY needs at least one request in flight"
+        );
         Config {
             scenarios,
             sizes: env_list("VLLM_ROUTER_BENCH_SIZES", &default_sizes)
@@ -195,10 +211,7 @@ impl Config {
                 .iter()
                 .map(|c| CorpusKind::parse(c).unwrap_or_else(|| panic!("unknown corpus {c}")))
                 .collect(),
-            concurrency: env_list("VLLM_ROUTER_BENCH_CONCURRENCY", "1,64")
-                .iter()
-                .map(|c| c.parse().expect("concurrency"))
-                .collect(),
+            concurrency,
             rate: env_num("VLLM_ROUTER_BENCH_RATE", 0.0),
             repeats: env_num("VLLM_ROUTER_BENCH_REPEATS", 1usize).max(1),
             warmup: Duration::from_secs(env_num("VLLM_ROUTER_BENCH_WARMUP_SECS", 5u64)),
@@ -563,9 +576,10 @@ struct Row {
     p90_us: u64,
     p99_us: u64,
     mean_us: f64,
-    /// `mean_us` minus the `direct_mock` mean for the same size/corpus/
-    /// concurrency/repeat, when that row was measured in this run. Means
-    /// subtract; percentiles do not, so no such column exists for them.
+    /// `mean_us` minus the direct mean on the same route for the same
+    /// size/corpus/concurrency/repeat, when that row was measured in this
+    /// run. Means subtract; percentiles do not, so no such column exists
+    /// for them.
     mean_minus_direct_us: Option<f64>,
     /// Fraction of the generation requests each mock worker served
     /// (router scenarios only).
@@ -714,6 +728,23 @@ fn render_summary(rows: &[Row]) -> String {
         ));
     }
     out
+}
+
+/// Every routed scenario needs a router-free scenario on its own route, or
+/// its `mean_minus_direct_us` would subtract another route's request and
+/// response cost.
+#[test]
+fn every_routed_scenario_has_a_direct_baseline() {
+    for routed in SCENARIOS.iter().filter(|s| s.policy.is_some()) {
+        assert!(
+            SCENARIOS
+                .iter()
+                .any(|s| s.policy.is_none() && s.route == routed.route),
+            "{} has no direct scenario on {:?}",
+            routed.name,
+            routed.route
+        );
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
@@ -908,13 +939,20 @@ async fn router_overhead() {
         w.stop().await;
     }
 
-    // Fill in the mean delta against direct_mock measured in the same repeat.
-    let direct: BTreeMap<(usize, usize, String, usize), f64> = rows
+    // Fill in the mean delta against the direct row on the same route,
+    // measured in the same repeat.
+    let direct: BTreeMap<(usize, String, usize, String, usize), f64> = rows
         .iter()
         .filter(|r| r.policy.is_none())
         .map(|r| {
             (
-                (r.repeat, r.size_bytes, r.corpus.clone(), r.concurrency),
+                (
+                    r.repeat,
+                    r.route.clone(),
+                    r.size_bytes,
+                    r.corpus.clone(),
+                    r.concurrency,
+                ),
                 r.mean_us,
             )
         })
@@ -922,7 +960,13 @@ async fn router_overhead() {
     for r in rows.iter_mut() {
         if r.policy.is_some() {
             r.mean_minus_direct_us = direct
-                .get(&(r.repeat, r.size_bytes, r.corpus.clone(), r.concurrency))
+                .get(&(
+                    r.repeat,
+                    r.route.clone(),
+                    r.size_bytes,
+                    r.corpus.clone(),
+                    r.concurrency,
+                ))
                 .map(|d| r.mean_us - d);
         }
     }

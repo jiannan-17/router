@@ -256,25 +256,22 @@ def main():
     # Build in release mode
     runner.build_release()
 
-    only_request_processing = [
-        name
-        for name, used in (
-            ("--quick", args.quick),
-            ("--save-baseline", args.save_baseline),
-            ("--compare-baseline", args.compare_baseline),
-            ("--validate-thresholds", args.validate_thresholds),
-            ("--save-results", args.save_results),
-        )
-        if used
+    # --save-baseline writes the criterion output of whichever bench ran, so
+    # it still applies to a different --bench; the rest are request_processing
+    # only, and the harness takes none of them.
+    inapplicable = [
+        ("--quick", args.quick),
+        ("--compare-baseline", args.compare_baseline),
+        ("--validate-thresholds", args.validate_thresholds),
+        ("--save-results", args.save_results),
     ]
-    if only_request_processing and (
-        args.router_overhead or args.bench != "request_processing"
-    ):
-        print(
-            "Note: "
-            + ", ".join(only_request_processing)
-            + " only apply to --bench request_processing and are ignored here."
-        )
+    if args.router_overhead:
+        inapplicable.append(("--save-baseline", args.save_baseline))
+    elif args.bench == "request_processing":
+        inapplicable = []
+    ignored = [name for name, used in inapplicable if used]
+    if ignored:
+        print("Note: ignoring " + ", ".join(ignored) + " for this run.")
 
     if args.router_overhead:
         runner.run_router_overhead()
