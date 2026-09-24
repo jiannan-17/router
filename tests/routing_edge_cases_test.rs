@@ -1,12 +1,5 @@
-//! Router edge cases: long prompts, the cache-aware threshold and load
-//! balance boundaries, non-ASCII match counting, stale tenants, session
-//! headers on long prompts, and the request body limit.
-//!
-//! The cache-aware and rendezvous inputs come from
-//! `tests/common/routing_edge.rs`, the same fixtures the `edge/*` groups of
-//! `benches/routing_input.rs` time, so the benchmarked cases are known to
-//! take the branch they are named after. Fixture configuration and the
-//! worker-to-branch mapping are documented there.
+//! CI checks for the fixtures timed by `benches/routing_input.rs`, plus
+//! stale-tenant cleanup and the HTTP request-body limit.
 
 mod common;
 
@@ -17,7 +10,7 @@ use common::bench_corpus::{completion_text, seeded_text, Corpus, CorpusKind, LON
 use common::bench_mock::BenchMockWorker;
 use common::routing_edge::{
     ascii_fork, branch, cache_aware_cases, rendezvous_pair, session_headers, workers,
-    CacheAwareFixture, BASE_LOADS, FIRST_HEALTHY, MIN_LOAD, TENANT, WORKERS,
+    CacheAwareFixture, BASE_LOADS, FIRST_HEALTHY, MIN_LOAD, TENANT, WORKERS, WORKER_COUNTS,
 };
 use std::sync::Arc;
 use tower::ServiceExt;
@@ -26,11 +19,8 @@ use vllm_router_rs::policies::{LoadBalancingPolicy, RendezvousHashPolicy, Reques
 use vllm_router_rs::routers::{RouterFactory, RouterTrait};
 use vllm_router_rs::tree::Tree;
 
-/// Every case in the table: the probe matches exactly the intended number
-/// of characters of the warmed key, and the policy selects the worker of
-/// the intended branch, both from a fresh fixture and after a reset (the
-/// state the benchmark measures from). Failures are collected so one run
-/// names every case that broke.
+/// Check character counts and branch selection, both before and after reset.
+/// Collect failures so one run identifies every broken case.
 #[test]
 fn cache_aware_cases_take_the_intended_branch() {
     let mut failures = Vec::new();
@@ -68,12 +58,8 @@ fn cache_aware_cases_take_the_intended_branch() {
     assert!(failures.is_empty(), "\n{}", failures.join("\n"));
 }
 
-/// A hit on a tenant that is down goes to the fallback, and the stale
-/// tenant is removed from the tree. The two are checked separately: the
-/// fallback picks the first healthy worker (W0), which a low-match miss
-/// would not (it picks W3); and once W1 is back, the prompt is a miss (W3)
-/// rather than a hit on W1 (tenant kept) or another fallback to W0 (nodes
-/// kept without a tenant).
+/// An unhealthy tenant falls back to W0 and is removed from the tree.
+/// After it recovers, the old key must miss (W3), not hit W1 or fall back again.
 #[test]
 fn stale_tenant_falls_back_and_is_forgotten() {
     let (warm, _) = ascii_fork(SEED, 2048, 2048);
@@ -93,30 +79,20 @@ fn stale_tenant_falls_back_and_is_forgotten() {
     );
 }
 
-/// The fixture the `edge/workers/cache_aware` benchmark uses: with the hot
-/// set warmed round-robin over `n` workers and no load, every hot prompt
-/// is a hit on its own tenant, so the benchmark measures hits.
+/// The worker-scaling benchmark must hit each prompt's assigned tenant.
 #[test]
 fn round_robin_tenants_hit_for_every_worker_count() {
     let corpus = Corpus::new(CorpusKind::Hot64, 2048);
     let prompts: Vec<String> = (0..64).map(|i| corpus.prompt(i)).collect();
-    for n in [1, 4, 16, 64] {
-        let warm = prompts
-            .iter()
-            .enumerate()
-            .map(|(i, p)| (i % n, p.clone()))
-            .collect();
-        let fixture = CacheAwareFixture::new(warm, &vec![0; n], &[]);
+    for n in WORKER_COUNTS {
+        let fixture = CacheAwareFixture::round_robin(&prompts, n);
         for (i, p) in prompts.iter().enumerate() {
             assert_eq!(fixture.select(p), Some(i % n), "{n} workers, prompt {i}");
         }
     }
 }
 
-/// A session header decides the worker for long prompts too. The pair is
-/// chosen so the prompts go to different workers without a header; with
-/// one header both go to the worker the header alone picks. An empty
-/// header value is ignored.
+/// A nonempty session header overrides both prompts; an empty one is ignored.
 #[test]
 fn session_header_overrides_long_prompts() {
     let policy = RendezvousHashPolicy::new();

@@ -117,9 +117,7 @@ fn builders_produce_typed_requests_with_expected_routing_text() {
     let completion = to_completion_request(&completion_text(&prompt));
     assert_eq!(completion.extract_text_for_routing(), prompt);
 
-    // Pre-tokenized prompts must deserialize as a single id sequence. The
-    // routing text derived from them is deliberately not pinned here: its
-    // format is under discussion (PR #237) and is not what this corpus tests.
+    // Check the input shape; the routing-key format is outside this corpus test.
     let by_ids = to_completion_request(&completion_ids(&[1, 2, 3]));
     assert!(matches!(by_ids.prompt, PromptInput::IntArray(ref ids) if ids == &[1, 2, 3]));
     let key = by_ids.extract_text_for_routing();
@@ -166,8 +164,7 @@ async fn bench_mock_worker_answers_health_and_generation_routes() {
 
 #[test]
 fn long_prompts_are_exact_and_the_body_pool_is_bounded() {
-    // Up to 16 KiB the pool is unchanged, so the corpora behind published
-    // numbers are byte-identical; longer prompts get a pool within budget.
+    // Preserve the default corpus pool; bound memory for the long inputs.
     for size in SIZES {
         assert_eq!(body_pool_len(size), BODY_POOL_SIZE);
     }

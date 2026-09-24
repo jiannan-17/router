@@ -1,37 +1,19 @@
-//! Deterministic prompt corpus and request builders shared by the routing
-//! benchmarks (`benches/routing_input.rs`) and the router overhead harness
-//! (`tests/router_overhead_bench.rs`).
+//! Deterministic prompts shared by Criterion, the overhead harness and CI.
 //!
-//! Everything here is derived from [`SEED`], the prompt size and the request
-//! index, so two runs on different machines see byte-identical requests.
-//! Prompt text is ASCII word salad and every prompt is exactly `size_bytes`
-//! long. Text that is not meant to be shared is drawn from a pool of
-//! [`BODY_POOL_SIZE`] distinct seeded bodies (fewer above 16 KiB, see
-//! [`body_pool_len`]) rather than one repeated body:
-//! routing-key code is content dependent (substring search, hashing, JSON
-//! parsing), and a single repeated body lets the CPU's branch predictors
-//! learn it. With one body, rendezvous-hash selection on 16 KiB prompts
-//! measured about three times cheaper than on 64 distinct prompts.
+//! Requests depend only on [`SEED`], input size and request index. Text
+//! prompts have exactly the requested byte length; [`IdCorpus`] uses ID counts.
+//! A pool of distinct bodies avoids repeatedly exercising the same content
+//! in substring searches, hashing and parsing (see [`body_pool_len`]).
 //!
-//! Corpus kinds:
-//! - `hot64`: 64 fixed prompts cycled by request index; after the first 64
-//!   requests every request repeats an earlier one (a cache-hit workload).
-//! - `cold`: every request carries a unique marker at the *start* of the
-//!   prompt, so no two requests share a prefix (a cache-miss workload).
-//! - `mixed90`: 90% `hot64`, 10% `cold` (every tenth request is unique).
-//! - `short_shared_prefix`: a shared prefix of at most 600 bytes (roughly
-//!   96-160 tokens for English text) followed by a unique tail; models a
-//!   shared system prompt with a varying user turn.
-//! - `long_shared_prefix`: everything but the last 64 bytes is shared; the
-//!   tail is unique. Models "same prefix, varying suffix": an exact-match
-//!   cache misses on every request while a prefix router still sees one
-//!   prefix.
-//! - `utf8_hot64`: like `hot64`, but the text after the ASCII marker is CJK
-//!   with some emoji, so the cache-aware tree takes its non-ASCII paths.
-//!   Still exactly `size_bytes` long; the character count is lower.
+//! Corpora:
+//! - `hot64`: cycle through 64 prompts.
+//! - `cold`: put a unique marker at the start of every prompt.
+//! - `mixed90`: 90% hot, 10% cold.
+//! - `short_shared_prefix`: share up to 600 bytes, then a unique tail.
+//! - `long_shared_prefix`: share everything except a unique 64-byte tail.
+//! - `utf8_hot64`: hot prompts with CJK, kana and emoji after the ASCII marker.
 //!
-//! Pre-tokenized prompts come from [`IdCorpus`], sized by id count rather
-//! than bytes.
+//! Other text corpora are ASCII. See `docs/benchmarks/router_overhead.md`.
 
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
@@ -60,8 +42,7 @@ pub const LONG_SHARED_PREFIX_TAIL_BYTES: usize = 64;
 pub const BODY_POOL_SIZE: usize = 256;
 /// Fewest distinct bodies, however long the prompts.
 pub const BODY_POOL_MIN_SIZE: usize = 8;
-/// Budget for the body pool of one corpus. Up to 16 KiB prompts the pool
-/// keeps all [`BODY_POOL_SIZE`] bodies; longer prompts get fewer.
+/// Target memory budget, subject to [`BODY_POOL_MIN_SIZE`].
 pub const BODY_POOL_MAX_BYTES: usize = 64 * 1024 * 1024;
 /// Model name carried by every request.
 pub const MODEL: &str = "mock-model";

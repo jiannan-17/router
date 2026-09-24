@@ -1,61 +1,17 @@
-//! Router overhead harness: what the router adds on top of a worker that
-//! does nothing, measured end to end on one machine.
+//! End-to-end router overhead against instant mock workers.
 //!
-//! One `vllm-router` process (the real binary, release profile recommended)
-//! is spawned per scenario cell in front of in-process mock workers that
-//! answer instantly. A client drives the router, and the harness reports
-//! client-observed latency, throughput, how the requests spread across the
-//! workers, and the router process's own CPU time and peak RSS, taken per
-//! process with `wait4(2)` after the process is stopped. The `direct_*`
-//! scenarios drive a mock worker without a router; each routed row is read
-//! against the direct row for its own route, since the request and response
-//! bodies differ between `/v1/completions` and `/v1/chat/completions`.
-//!
-//! Numbers from this harness describe router cost only. Nothing here can
-//! show a routing *benefit* (KV-cache hits, time to first token); that needs
-//! real workers.
-//!
-//! The client and the mock workers share one 8-thread runtime in this
-//! process; the router runs as a separate process with its default thread
-//! count. On a machine with fewer spare cores than that, router rows include
-//! CPU contention the direct rows do not have; the report records
-//! the thread counts and the CPU this process used per cell so it is visible.
+//! Each routed cell starts a router process and measures latency, throughput, load
+//! spread, router CPU and peak RSS. Direct requests on the same route provide
+//! the baseline. These results measure router cost; mocks cannot show KV-cache
+//! benefits. The client and mocks share an 8-thread runtime.
 //!
 //! Ignored by default. Run with:
-//!
 //! ```text
 //! cargo test --release --test router_overhead_bench -- --ignored --nocapture
 //! ```
 //!
-//! Knobs (environment variables, all optional):
-//! - `VLLM_ROUTER_BENCH_SCENARIOS`: comma list of `direct_completions`,
-//!   `direct_chat`, `completions_off`, `completions_rendezvous`, `chat_off`
-//!   (default: all). A routed scenario reports no delta unless the direct
-//!   scenario on its route runs too.
-//! - `VLLM_ROUTER_BENCH_SIZES`: prompt bytes, default `200,2048,16384`
-//! - `VLLM_ROUTER_BENCH_CORPORA`: `hot64,cold,mixed90,short_shared_prefix,
-//!   long_shared_prefix,utf8_hot64`, default `hot64,cold`. From 128 KiB up,
-//!   `cold`, `mixed90` and `short_shared_prefix` are refused: every request
-//!   adds about its size to the cache-aware tree, which is never evicted
-//!   inside a cell.
-//! - `VLLM_ROUTER_BENCH_PROMPT_IDS`: pre-tokenized prompt lengths (token
-//!   ids), default none. These cells run on the completions scenarios only
-//!   and are not crossed with sizes and corpora.
-//! - `VLLM_ROUTER_BENCH_CONCURRENCY`: default `1,64`
-//! - `VLLM_ROUTER_BENCH_RATE`: target requests per second across all
-//!   client tasks; `0` (default) is closed loop, each task sends the next
-//!   request as soon as the previous response is read
-//! - `VLLM_ROUTER_BENCH_REPEATS`: how many times to run the whole matrix,
-//!   rotating the scenario order each time; default `1`
-//! - `VLLM_ROUTER_BENCH_WARMUP_SECS` / `VLLM_ROUTER_BENCH_MEASURE_SECS`:
-//!   default `5` / `20`
-//! - `VLLM_ROUTER_BENCH_WORKERS`: mock workers behind the router, default `4`
-//! - `VLLM_ROUTER_BENCH_ROUTER_CPUS`: Linux only; run the router under
-//!   `taskset -c <list>` so only the router is pinned
-//! - `VLLM_ROUTER_BENCH_OUT_DIR`: default `target/router_overhead`
-//!
-//! See `docs/benchmarks/router_overhead.md` for the method and the report
-//! template.
+//! See `docs/benchmarks/router_overhead.md` for configuration, input sizes,
+//! measurement limits and the report format.
 
 #![cfg(unix)]
 
@@ -76,16 +32,13 @@ use std::time::{Duration, Instant};
 
 /// Worker threads of the runtime that hosts the client and the mock workers.
 const HARNESS_WORKER_THREADS: usize = 8;
-/// `--eviction-interval` passed to every router. Longer than any cell, so
-/// the cache-aware tree is never evicted while a cell runs: rows for
-/// non-repeating corpora include the tree's growth, deterministically.
+/// Eviction interval passed to each router; keeps eviction out of normal cells.
 const EVICTION_INTERVAL_SECS: u64 = 3600;
 /// `--max-tree-size` passed to every router (the CLI default, made explicit).
 const MAX_TREE_SIZE: usize = 67_108_864;
 /// Attempts to start a router when its port was taken between pick and bind.
 const ROUTER_START_ATTEMPTS: usize = 3;
-/// Prompts this long or longer only run on corpora whose requests repeat
-/// (see [`grows_tree_per_request`]).
+/// Reject corpora with large per-request tree growth at this size and above.
 const LONG_PROMPT_BYTES: usize = 128 * 1024;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -110,9 +63,7 @@ impl Route {
     }
 }
 
-/// What a cell sends: text prompts of a fixed byte size, or pre-tokenized
-/// prompts of a fixed id count. Rows, direct baselines and summaries are
-/// keyed by it, so the two never mix.
+/// Input size and unit, kept distinct in rows, baselines and summaries.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize)]
 #[serde(rename_all = "snake_case")]
 enum InputSpec {
@@ -687,8 +638,7 @@ struct Row {
     policy: Option<String>,
     route: String,
     input: InputSpec,
-    /// Serialized size of request 0. Every request of a cell has the same
-    /// size by construction (`tests/bench_corpus_test.rs` checks it).
+    /// Serialized request size, constant within a cell (checked in corpus tests).
     body_bytes: usize,
     corpus: String,
     concurrency: usize,
@@ -727,10 +677,8 @@ struct Row {
     harness_cpu_s: f64,
     /// Wall-clock seconds of the same interval.
     harness_wall_s: f64,
-    /// `harness_cpu_s / harness_wall_s`: cores the client and the mock
-    /// workers kept busy on average. A hint only: the client can limit
-    /// throughput without keeping every runtime thread busy, especially at
-    /// low concurrency.
+    /// Average busy cores: `harness_cpu_s / harness_wall_s`.
+    /// Low utilization alone does not rule out a client bottleneck.
     harness_cores: f64,
 }
 

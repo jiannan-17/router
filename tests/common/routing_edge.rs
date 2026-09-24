@@ -1,20 +1,9 @@
-//! Router edge cases shared by the `edge/*` groups of
-//! `benches/routing_input.rs` and by `tests/routing_edge_cases_test.rs`, so
-//! the benchmark times exactly the inputs and starting state the test
-//! asserts on.
+//! Fixtures shared by the edge benchmarks and CI tests.
 //!
-//! Cache-aware cases run on four workers with an explicit configuration
-//! ([`fixture_config`]) and a fixed load pattern ([`BASE_LOADS`]), so the
-//! selected worker names the branch that ran:
-//! - [`TENANT`] (W1) holds the warmed key: selecting it is a cache hit.
-//! - [`MIN_LOAD`] (W3) is the only least-loaded worker: selecting it is the
-//!   low-match path or the imbalanced path.
-//! - [`FIRST_HEALTHY`] (W0) is the first healthy worker while W1 is down:
-//!   selecting it is the stale-tenant fallback.
-//!
-//! `select_worker` inserts every routed prompt into the tree, so each case
-//! is measured from a fresh copy of its starting state:
-//! [`CacheAwareFixture::reset`] empties the tree and warms it again.
+//! With [`BASE_LOADS`], W1 identifies a cache hit, W3 a low-match or
+//! imbalanced selection, and W0 the fallback when W1 is unhealthy.
+//! Routing inserts the probe, so benchmarks reset the fixture outside
+//! each timed call.
 
 use super::bench_corpus::{seeded_text, seeded_utf8_text, SEED};
 use std::collections::HashMap;
@@ -24,29 +13,26 @@ use vllm_router_rs::policies::{
     CacheAwareConfig, CacheAwarePolicy, LoadBalancingPolicy, RendezvousHashPolicy, RequestHeaders,
 };
 
-/// Workers behind every cache-aware case and the rendezvous pair.
+/// Workers in branch cases and the rendezvous pair.
 pub const WORKERS: usize = 4;
+/// Worker counts shared by the scaling test and benchmark.
+pub const WORKER_COUNTS: [usize; 4] = [1, 4, 16, 64];
 /// Holds the warmed key.
 pub const TENANT: usize = 1;
 /// The only least-loaded worker under [`BASE_LOADS`].
 pub const MIN_LOAD: usize = 3;
 /// The first healthy worker while [`TENANT`] is down.
 pub const FIRST_HEALTHY: usize = 0;
-/// Balanced (a difference of one is below any threshold) with a single
-/// least-loaded worker that is not the tenant.
+/// Balanced loads with W3 as the only least-loaded worker.
 pub const BASE_LOADS: [usize; WORKERS] = [1, 1, 1, 0];
 
-/// A character that never occurs in the corpus text. A probe continues
-/// with it where it must stop matching the warmed key.
+/// Absent from the corpus, so a prefix match stops here.
 const FORK: char = '~';
 /// CJK characters for the hand-built UTF-8 cases.
 const CJK: &str = "路由缓存前缀令牌请求延迟预算策略解码批次队列健康重试会话模型提示";
 
-/// The configuration of every cache-aware fixture, set in full so no case
-/// depends on a default. This is not `CacheAwareConfig::default()` (0.5,
-/// 32, 1.1, 30 s) and not the CLI default (0.3, 64, 1.5, 120 s): the small
-/// balance thresholds let single-digit loads cross them, and eviction is
-/// off so nothing changes the tree behind a case's back.
+/// Explicit thresholds for boundary tests; eviction is disabled.
+/// These differ from both library and CLI defaults (see the benchmark docs).
 pub fn fixture_config() -> CacheAwareConfig {
     CacheAwareConfig {
         cache_threshold: 0.5,
@@ -79,9 +65,7 @@ fn set_loads(workers: &[Arc<dyn Worker>], loads: &[usize]) {
     }
 }
 
-/// A cache-aware policy, its workers and a starting state that
-/// [`reset`](Self::reset) restores: the warmed keys and their tenants, the
-/// worker loads and which workers are down.
+/// Restores warmed keys, worker loads and health before each measurement.
 pub struct CacheAwareFixture {
     policy: CacheAwarePolicy,
     workers: Vec<Arc<dyn Worker>>,
@@ -103,10 +87,18 @@ impl CacheAwareFixture {
         fixture
     }
 
-    /// Empty the tree, then warm every key onto its tenant and restore the
-    /// loads and health. A key is warmed by making its tenant the only
-    /// least-loaded worker and routing the key, so the tenant does not
-    /// depend on tie-breaking.
+    /// Warm prompts round-robin across workers, with no outstanding load.
+    pub fn round_robin(prompts: &[String], n: usize) -> Self {
+        let warm = prompts
+            .iter()
+            .enumerate()
+            .map(|(i, p)| (i % n, p.clone()))
+            .collect();
+        Self::new(warm, &vec![0; n], &[])
+    }
+
+    /// Clear and re-warm the tree, then restore loads and health.
+    /// Each key's tenant is the only least-loaded worker during warming.
     pub fn reset(&self) {
         self.clear();
         for w in &self.workers {
@@ -129,8 +121,7 @@ impl CacheAwareFixture {
         }
     }
 
-    /// Remove every worker from the tree. `remove_tenant` prunes nodes left
-    /// without a tenant, so only the root remains.
+    /// Removing all tenants prunes the tree to its root.
     fn clear(&self) {
         for w in &self.workers {
             self.policy.remove_worker(w.as_ref());
@@ -152,25 +143,20 @@ impl CacheAwareFixture {
 }
 
 impl Drop for CacheAwareFixture {
-    /// Leave only the root behind: a `Tree` dropped with nodes in it never
-    /// frees them (each node holds a strong reference to its parent).
+    /// Prune nodes before dropping the tree to break parent/child Arc cycles.
     fn drop(&mut self) {
         self.clear();
     }
 }
 
-/// A built case: the fixture in its starting state, the probe to route,
-/// and the `(matched, input)` character counts
-/// `Tree::prefix_match_with_counts` must report for the probe against the
-/// warmed key.
+/// A ready-to-run fixture, probe, and expected `(matched, input)` character counts.
 pub struct BuiltCase {
     pub fixture: CacheAwareFixture,
     pub probe: String,
     pub matched_chars: (usize, usize),
 }
 
-/// One cache-aware edge case. Built on demand so a benchmark or test holds
-/// one case's long inputs at a time.
+/// Builds long inputs on demand so only one case is held at a time.
 pub struct CacheAwareCase {
     pub name: String,
     /// The worker selected when the intended branch runs.
@@ -224,10 +210,8 @@ pub fn size_label(bytes: usize) -> String {
     }
 }
 
-/// `(warm, probe)` of `total` ASCII bytes where `probe` shares exactly its
-/// first `shared` bytes with `warm` and then continues with [`FORK`], so a
-/// prefix match stops there. `shared == total` makes the probe equal to the
-/// warmed key.
+/// Equal-length ASCII keys sharing exactly `shared` bytes before [`FORK`].
+/// When `shared == total`, the keys are identical.
 pub fn ascii_fork(seed: u64, total: usize, shared: usize) -> (String, String) {
     let warm = seeded_text(seed, total);
     let mut probe = String::with_capacity(total);
@@ -239,10 +223,9 @@ pub fn ascii_fork(seed: u64, total: usize, shared: usize) -> (String, String) {
     (warm, probe)
 }
 
-/// `(warm, probe)` of CJK text: `warm` is `total_bytes` long, `probe` has
-/// the same number of characters and shares exactly its first
-/// `shared_percent` percent of them with `warm` before [`FORK`]. Returns
-/// the shared and total character counts too.
+/// CJK keys with equal character counts and a controlled shared prefix.
+/// Returns `(warm, probe, shared_chars, total_chars)`. Only `warm` has the
+/// requested byte size.
 fn utf8_fork(
     seed: u64,
     total_bytes: usize,
@@ -300,60 +283,39 @@ fn utf8_case(
     })
 }
 
-/// Every cache-aware edge case. `bench` marks the ones
-/// `edge/cache_aware` times.
+/// All CI cases; `bench` marks the subset timed by Criterion.
 pub fn cache_aware_cases() -> Vec<CacheAwareCase> {
     const ONE_MIB: usize = 1024 * 1024;
     const SMALL: usize = 2048;
     let mut cases = Vec::new();
 
-    // Long prompts: a full hit (the whole key is walked and re-inserted)
-    // and a cold request (no shared prefix; the whole prompt becomes a new
-    // leaf).
     for size in super::bench_corpus::LONG_SIZES {
-        let label = size_label(size);
-        cases.push(ascii_case(
-            format!("long_hit/{label}"),
-            TENANT,
-            true,
-            size,
-            size,
-            BASE_LOADS,
-        ));
-        cases.push(ascii_case(
-            format!("long_cold/{label}"),
-            MIN_LOAD,
-            true,
-            size,
-            0,
-            BASE_LOADS,
-        ));
+        for (name, shared, expect) in [("long_hit", size, TENANT), ("long_cold", 0, MIN_LOAD)] {
+            cases.push(ascii_case(
+                format!("{name}/{}", size_label(size)),
+                expect,
+                true,
+                size,
+                shared,
+                BASE_LOADS,
+            ));
+        }
     }
 
-    // Either side of `cache_threshold` (0.5): 45% of the probe shared is a
-    // miss, 55% a hit.
     for size in [16 * 1024, ONE_MIB] {
-        let label = size_label(size);
-        cases.push(ascii_case(
-            format!("threshold_45pct/{label}"),
-            MIN_LOAD,
-            true,
-            size,
-            size * 45 / 100,
-            BASE_LOADS,
-        ));
-        cases.push(ascii_case(
-            format!("threshold_55pct/{label}"),
-            TENANT,
-            true,
-            size,
-            size * 55 / 100,
-            BASE_LOADS,
-        ));
+        for (percent, expect) in [(45, MIN_LOAD), (55, TENANT)] {
+            cases.push(ascii_case(
+                format!("threshold_{percent}pct/{}", size_label(size)),
+                expect,
+                true,
+                size,
+                size * percent / 100,
+                BASE_LOADS,
+            ));
+        }
     }
 
-    // Exactly at the threshold and one character either side. The rule is
-    // `match_rate > cache_threshold`, so exactly half is still a miss.
+    // `match_rate > 0.5`: exactly half is still a miss.
     for size in [2000, ONE_MIB] {
         let label = size_label(size);
         let half = size / 2;
@@ -373,9 +335,8 @@ pub fn cache_aware_cases() -> Vec<CacheAwareCase> {
         }
     }
 
-    // Load balance: imbalanced only when `max - min > 5 && max > 2 * min`.
-    // The probe is the warmed key, so a balanced state is a hit on W1 and
-    // an imbalanced one skips the prefix lookup for the least loaded W3.
+    // Imbalanced only when `max - min > 5 && max > 2 * min`.
+    // A full hit selects W1 if balanced, W3 otherwise.
     cases.push(ascii_case(
         "imbalanced/16KiB".to_string(),
         MIN_LOAD,
@@ -401,8 +362,7 @@ pub fn cache_aware_cases() -> Vec<CacheAwareCase> {
         ));
     }
 
-    // Long non-ASCII keys: a full hit, and a probe that shares 45% of the
-    // characters (all CJK) before it forks.
+    // Long non-ASCII keys: a full hit and a 45% character match.
     cases.push(CacheAwareCase::new(
         "utf8_hit/1MiB".to_string(),
         TENANT,
@@ -493,9 +453,7 @@ pub fn rendezvous_pair(size: usize) -> (String, String) {
     panic!("no two of 32 seeded {size}-byte prompts hash to different workers");
 }
 
-/// An ASCII prompt of `size` bytes with `"user": "u-1"` in the middle, as
-/// in a pasted JSON document. `rendezvous_hash` scans the routing text for
-/// such fields, so this prompt is keyed by the field, not by its content.
+/// A prompt containing a JSON-like `"user"` field, which rendezvous uses as its key.
 pub fn json_like_prompt(size: usize) -> String {
     const FIELD: &str = "\"user\": \"u-1\"";
     let before = (size - FIELD.len()) / 2;

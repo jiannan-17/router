@@ -1,52 +1,22 @@
-//! Per-request routing-input cost on the CPU fast path.
-//!
-//! Establishes the "before" numbers for the tokenizer/L0 request-path
-//! integration (roadmap #244, Issue 1): what the router spends today to
-//! derive the routing key from a typed request and to select a worker,
-//! before any tokenizer runs in the request path.
+//! CPU cost of routing inputs, before tokenizer integration (#244).
 //!
 //! Groups:
-//! - `routing_key/extract_text_for_routing/{completion,chat}/{size}`:
-//!   `GenerationRequest::extract_text_for_routing` as called once per request
-//!   in `Router::route_typed_request`, including dropping the returned
-//!   `String` as the router does. (`iter_with_large_drop` would keep a whole
-//!   sample's worth of 16 KiB strings alive and needs tens of GB.)
-//! - `policy/{cache_aware,rendezvous_hash}/{size}`: `select_worker` over four
-//!   healthy workers with the routing text of a hot-set prompt.
-//! - `cache_aware_key_format/{raw_text,one_char_per_token,digit_tagged}/{tokens}`:
-//!   `Tree::insert` (64 keys into a fresh tree) and
-//!   `Tree::prefix_match_with_counts` (one probe sharing the first half of
-//!   the warmed keys) for three candidate key encodings at equal token
-//!   counts; raw text uses about four bytes per token. This is input for the discussion on
-//!   token-id routing keys (PR #237); it does not exercise any router code
-//!   path beyond the tree.
-//! - `edge/*`: router edge cases, from `tests/common/routing_edge.rs`. Each
-//!   case asserts the branch it is named after before it is timed, and
-//!   `tests/routing_edge_cases_test.rs` asserts the same cases in CI.
-//!   - `edge/cache_aware/{case}`: one `select_worker` from the case's
-//!     starting state, restored untimed before every call because routing
-//!     inserts the prompt: long prompts (128 KiB to 1 MiB) as a full hit or
-//!     cold, 45% and 55% shared around `cache_threshold`, imbalanced load,
-//!     long CJK keys.
-//!   - `edge/long_input/{deserialize,extract,serialize}/{completion,chat}/{size}`:
-//!     the body work the router does per long request besides routing:
-//!     `axum::Json::from_bytes` into the typed request (what the handler's
-//!     extractor runs), the routing-text copy, and the `serde_json::to_vec`
-//!     that forwards it; `deserialize/{completion,chat}_utf8/{size}` parse
-//!     CJK text of the same sizes.
-//!   - `edge/rendezvous/{body,header}/{size}`: long prompts without and with
-//!     an `x-session-id` header; `json_like_prompt/{size}` has a `"user"`
-//!     field in the prompt text.
-//!   - `edge/token_ids/{deserialize,extract}/ids{n}`: pre-tokenized prompts,
-//!     parsed the same way.
-//!   - `edge/workers/{rendezvous,cache_aware}/{n}`: 1 to 64 workers.
+//! - `routing_key`: extract routing text from completion and chat requests.
+//! - `policy`: select a worker from a warmed hot set.
+//! - `cache_aware_key_format`: compare tree key encodings at equal token counts.
+//! - `edge/cache_aware`: long keys, match thresholds, load balance and UTF-8.
+//! - `edge/long_input`: parse, extract and serialize long request bodies.
+//! - `edge/rendezvous`: long prompts with and without session headers.
+//! - `edge/token_ids`: parse and extract pre-tokenized prompts.
+//! - `edge/workers`: selection across 1 to 64 workers.
 //!
-//! Inputs come from `tests/common/bench_corpus.rs` and
-//! `tests/common/routing_edge.rs` (seeded, offline), so the benchmark needs
-//! no network and no tokenizer file.
+//! Inputs are deterministic and offline. Edge fixtures are shared with CI
+//! tests; cache-aware cases also assert their expected branch before timing.
+//! Returned routing strings are dropped inside the timed call. Keeping a
+//! whole sample's strings alive would require tens of GB.
 //!
-//! Run with: `cargo bench --bench routing_input` (only the edge cases:
-//! `cargo bench --bench routing_input -- edge/`)
+//! Run: `cargo bench --bench routing_input` (append `-- edge/` for edge cases).
+//! See `docs/benchmarks/router_overhead.md` for the method and group details.
 
 use axum::Json;
 use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
@@ -70,7 +40,7 @@ use common::bench_corpus::{
 };
 use common::routing_edge::{
     cache_aware_cases, json_like_prompt, rendezvous_pair, session_headers, size_label, workers,
-    CacheAwareFixture,
+    CacheAwareFixture, WORKER_COUNTS,
 };
 
 /// A routing-key builder for one candidate encoding.
@@ -79,8 +49,6 @@ type KeyFn = Box<dyn Fn(u64) -> String>;
 const WORKER_COUNT: usize = 4;
 const TOKEN_COUNTS: [usize; 4] = [128, 512, 2048, 8192];
 const VOCAB: u32 = 32_000;
-/// Worker counts for `edge/workers`.
-const EDGE_WORKER_COUNTS: [usize; 4] = [1, 4, 16, 64];
 /// Inputs at or above this size get criterion's minimum sample count.
 const LARGE_INPUT_BYTES: usize = 512 * 1024;
 
@@ -234,12 +202,8 @@ fn bench_key_format(c: &mut Criterion) {
                 keys.iter().map(|k| k.chars().count()).sum::<usize>() / keys.len();
             eprintln!("{name}/{n} tokens: key ~{key_bytes} bytes, ~{key_chars} chars");
 
-            // insert: 64 distinct keys into an empty tree per iteration, so
-            // throughput counts every inserted token. The tree is emptied with
-            // `remove_tenant` outside the timed region rather than dropped:
-            // `Node` holds a strong reference to its parent, so dropping a
-            // populated `Tree` never frees its nodes, and a fresh tree per
-            // iteration grows memory until the process is killed.
+            // Time all 64 inserts. Prune outside the timer to break the
+            // parent/child Arc cycles that dropping a populated tree would retain.
             group.throughput(Throughput::Elements((keys.len() * n) as u64));
             group.bench_with_input(
                 BenchmarkId::new(format!("{name}/insert"), n),
@@ -281,8 +245,7 @@ fn bench_key_format(c: &mut Criterion) {
     group.finish();
 }
 
-/// Apply the edge groups' timing: short warmup and measurement, and the
-/// minimum sample count for inputs of `LARGE_INPUT_BYTES` or more.
+/// Use fewer samples for large inputs.
 fn edge_timing<M: criterion::measurement::Measurement>(
     group: &mut criterion::BenchmarkGroup<'_, M>,
     input_bytes: usize,
@@ -361,8 +324,7 @@ fn bench_edge_long_input(c: &mut Criterion) {
             b.iter(|| black_box(serde_json::to_vec(&chat_req).expect("json")));
         });
 
-        // As in `routing_key/*`: the returned text is dropped inside the
-        // timed call, as the router drops it.
+        // Include dropping the returned text, as in the request path.
         group.throughput(Throughput::Bytes(size as u64));
         group.bench_function(format!("extract/completion/{label}"), |b| {
             b.iter(|| black_box(completion.extract_text_for_routing()));
@@ -372,10 +334,7 @@ fn bench_edge_long_input(c: &mut Criterion) {
             b.iter(|| black_box(chat_req.extract_text_for_routing()));
         });
 
-        // The same sizes of CJK text. Parsing depends on the characters,
-        // not only the bytes: the untagged `PromptInput` tries its string
-        // variant last, and every failed variant formats the whole prompt
-        // into its error message, which is much slower for non-ASCII text.
+        // Equal byte sizes of CJK text expose character-dependent parsing cost.
         let utf8_prompt = seeded_utf8_text(SEED ^ size as u64, size);
         let utf8_completion = serde_json::to_vec(&completion_text(&utf8_prompt)).expect("json");
         let utf8_chat = serde_json::to_vec(&chat(None, &utf8_prompt)).expect("json");
@@ -404,8 +363,7 @@ fn bench_edge_rendezvous(c: &mut Criterion) {
     for size in LONG_SIZES {
         let label = size_label(size);
         edge_timing(&mut group, size);
-        // A pair that hashes to different workers without a header; the
-        // benchmark routes the first of them.
+        // Reuse the pair checked by the session-header test.
         let (prompt, _) = rendezvous_pair(size);
         group.bench_function(format!("body/{label}"), |b| {
             b.iter(|| black_box(policy.select_worker_with_headers(&workers, Some(&prompt), None)));
@@ -456,7 +414,7 @@ fn bench_edge_workers(c: &mut Criterion) {
     edge_timing(&mut group, 2048);
     group.throughput(Throughput::Elements(1));
     let policy = RendezvousHashPolicy::new();
-    for n in EDGE_WORKER_COUNTS {
+    for n in WORKER_COUNTS {
         let workers = workers(n);
         let mut i = 0usize;
         group.bench_function(format!("rendezvous/{n}"), |b| {
@@ -467,15 +425,8 @@ fn bench_edge_workers(c: &mut Criterion) {
             });
         });
 
-        // Hot prompts warmed round-robin over the workers, no load: every
-        // request is a hit on its own tenant and re-inserting a known key
-        // leaves the tree unchanged, so no reset is needed.
-        let warm = prompts
-            .iter()
-            .enumerate()
-            .map(|(k, p)| (k % n, p.clone()))
-            .collect();
-        let fixture = CacheAwareFixture::new(warm, &vec![0; n], &[]);
+        // Repeated hits leave the tree unchanged, so no reset is needed.
+        let fixture = CacheAwareFixture::round_robin(&prompts, n);
         for (k, p) in prompts.iter().enumerate() {
             assert_eq!(fixture.select(p), Some(k % n), "{n} workers, prompt {k}");
         }
