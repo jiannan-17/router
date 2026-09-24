@@ -34,7 +34,13 @@
 //!   scenario on its route runs too.
 //! - `VLLM_ROUTER_BENCH_SIZES`: prompt bytes, default `200,2048,16384`
 //! - `VLLM_ROUTER_BENCH_CORPORA`: `hot64,cold,mixed90,short_shared_prefix,
-//!   long_shared_prefix`, default `hot64,cold`
+//!   long_shared_prefix,utf8_hot64`, default `hot64,cold`. From 128 KiB up,
+//!   `cold`, `mixed90` and `short_shared_prefix` are refused: every request
+//!   adds about its size to the cache-aware tree, which is never evicted
+//!   inside a cell.
+//! - `VLLM_ROUTER_BENCH_PROMPT_IDS`: pre-tokenized prompt lengths (token
+//!   ids), default none. These cells run on the completions scenarios only
+//!   and are not crossed with sizes and corpora.
 //! - `VLLM_ROUTER_BENCH_CONCURRENCY`: default `1,64`
 //! - `VLLM_ROUTER_BENCH_RATE`: target requests per second across all
 //!   client tasks; `0` (default) is closed loop, each task sends the next
@@ -55,7 +61,9 @@
 
 mod common;
 
-use common::bench_corpus::{chat, completion_text, Corpus, CorpusKind, SIZES};
+use common::bench_corpus::{
+    chat, completion_ids, completion_text, Corpus, CorpusKind, IdCorpus, SIZES,
+};
 use common::bench_mock::BenchMockWorker;
 use reqwest::header::CONTENT_TYPE;
 use serde::Serialize;
@@ -76,6 +84,9 @@ const EVICTION_INTERVAL_SECS: u64 = 3600;
 const MAX_TREE_SIZE: usize = 67_108_864;
 /// Attempts to start a router when its port was taken between pick and bind.
 const ROUTER_START_ATTEMPTS: usize = 3;
+/// Prompts this long or longer only run on corpora whose requests repeat
+/// (see [`grows_tree_per_request`]).
+const LONG_PROMPT_BYTES: usize = 128 * 1024;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Route {
@@ -97,6 +108,83 @@ impl Route {
             Route::Chat => chat(None, prompt).to_string(),
         }
     }
+}
+
+/// What a cell sends: text prompts of a fixed byte size, or pre-tokenized
+/// prompts of a fixed id count. Rows, direct baselines and summaries are
+/// keyed by it, so the two never mix.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum InputSpec {
+    TextBytes(usize),
+    TokenIds(usize),
+}
+
+impl InputSpec {
+    fn label(self) -> String {
+        match self {
+            InputSpec::TextBytes(n) => format!("text{n}"),
+            InputSpec::TokenIds(n) => format!("ids{n}"),
+        }
+    }
+}
+
+/// One input of the matrix.
+#[derive(Clone, Copy, Debug)]
+enum Input {
+    Text { bytes: usize, kind: CorpusKind },
+    Ids { count: usize },
+}
+
+impl Input {
+    fn spec(self) -> InputSpec {
+        match self {
+            Input::Text { bytes, .. } => InputSpec::TextBytes(bytes),
+            Input::Ids { count } => InputSpec::TokenIds(count),
+        }
+    }
+
+    fn corpus_name(self) -> &'static str {
+        match self {
+            Input::Text { kind, .. } => kind.name(),
+            Input::Ids { .. } => "token_ids",
+        }
+    }
+
+    fn prompts(self) -> Prompts {
+        match self {
+            Input::Text { bytes, kind } => Prompts::Text(Corpus::new(kind, bytes)),
+            Input::Ids { count } => Prompts::Ids(IdCorpus::new(count)),
+        }
+    }
+}
+
+/// The prompts of one input, built once and shared by its cells.
+enum Prompts {
+    Text(Corpus),
+    Ids(IdCorpus),
+}
+
+impl Prompts {
+    /// Request body number `i`. Id prompts go to `/v1/completions` only.
+    fn body(&self, route: Route, i: usize) -> String {
+        match self {
+            Prompts::Text(corpus) => route.body(&corpus.prompt(i)),
+            Prompts::Ids(corpus) => {
+                assert_eq!(route, Route::Completions, "id prompts are completions only");
+                completion_ids(corpus.prompt_ids(i)).to_string()
+            }
+        }
+    }
+}
+
+/// Corpora whose requests add new text to the cache-aware tree on every
+/// request, about as much as the prompt size.
+fn grows_tree_per_request(kind: CorpusKind) -> bool {
+    matches!(
+        kind,
+        CorpusKind::Cold | CorpusKind::Mixed90 | CorpusKind::ShortSharedPrefix
+    )
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -139,6 +227,7 @@ struct Config {
     scenarios: Vec<Scenario>,
     sizes: Vec<usize>,
     corpora: Vec<CorpusKind>,
+    prompt_ids: Vec<usize>,
     concurrency: Vec<usize>,
     rate: f64,
     repeats: usize,
@@ -166,6 +255,24 @@ fn env_num<T: std::str::FromStr>(name: &str, default: T) -> T {
 }
 
 impl Config {
+    /// The inputs a scenario on `route` runs: every size with every corpus,
+    /// then, on `/v1/completions` only, every id count.
+    fn inputs(&self, route: Route) -> Vec<Input> {
+        let mut inputs: Vec<Input> = self
+            .sizes
+            .iter()
+            .flat_map(|&bytes| {
+                self.corpora
+                    .iter()
+                    .map(move |&kind| Input::Text { bytes, kind })
+            })
+            .collect();
+        if route == Route::Completions {
+            inputs.extend(self.prompt_ids.iter().map(|&count| Input::Ids { count }));
+        }
+        inputs
+    }
+
     fn from_env() -> Config {
         let scenarios = env_list("VLLM_ROUTER_BENCH_SCENARIOS", "")
             .into_iter()
@@ -201,16 +308,35 @@ impl Config {
             concurrency.iter().all(|&c| c > 0),
             "VLLM_ROUTER_BENCH_CONCURRENCY needs at least one request in flight"
         );
+        let sizes: Vec<usize> = env_list("VLLM_ROUTER_BENCH_SIZES", &default_sizes)
+            .iter()
+            .map(|s| s.parse().expect("size"))
+            .collect();
+        let corpora: Vec<CorpusKind> = env_list("VLLM_ROUTER_BENCH_CORPORA", "hot64,cold")
+            .iter()
+            .map(|c| CorpusKind::parse(c).unwrap_or_else(|| panic!("unknown corpus {c}")))
+            .collect();
+        assert!(
+            !(sizes.iter().any(|&s| s >= LONG_PROMPT_BYTES)
+                && corpora.iter().any(|&k| grows_tree_per_request(k))),
+            "prompts of {LONG_PROMPT_BYTES} bytes or more cannot run on cold, mixed90 or \
+             short_shared_prefix: every request adds about its size to the cache-aware tree, \
+             which is never evicted inside a cell. Use hot64, utf8_hot64 or long_shared_prefix \
+             (see docs/benchmarks/router_overhead.md)"
+        );
+        let prompt_ids: Vec<usize> = env_list("VLLM_ROUTER_BENCH_PROMPT_IDS", "")
+            .iter()
+            .map(|n| n.parse().expect("prompt ids"))
+            .collect();
+        assert!(
+            prompt_ids.iter().all(|&n| n > 0),
+            "VLLM_ROUTER_BENCH_PROMPT_IDS needs at least one id per prompt"
+        );
         Config {
             scenarios,
-            sizes: env_list("VLLM_ROUTER_BENCH_SIZES", &default_sizes)
-                .iter()
-                .map(|s| s.parse().expect("size"))
-                .collect(),
-            corpora: env_list("VLLM_ROUTER_BENCH_CORPORA", "hot64,cold")
-                .iter()
-                .map(|c| CorpusKind::parse(c).unwrap_or_else(|| panic!("unknown corpus {c}")))
-                .collect(),
+            sizes,
+            corpora,
+            prompt_ids,
             concurrency,
             rate: env_num("VLLM_ROUTER_BENCH_RATE", 0.0),
             repeats: env_num("VLLM_ROUTER_BENCH_REPEATS", 1usize).max(1),
@@ -430,7 +556,7 @@ struct LoadResult {
 struct LoadSpec {
     base_url: String,
     route: Route,
-    corpus: Arc<Corpus>,
+    prompts: Arc<Prompts>,
     concurrency: usize,
     rate: f64,
     warmup: Duration,
@@ -442,15 +568,16 @@ struct LoadSpec {
 /// been read. With `rate > 0` every task paces itself to `rate /
 /// concurrency` requests per second (a rate cap, still at most one request
 /// in flight per task), so arms can be compared at the same offered load.
-/// Request `i` of the run uses `corpus.prompt(i)`; tasks interleave indices
-/// so every corpus kind sees the sequence it was designed for. Every body is
-/// built the same way for every corpus, outside the timed region. Latency
+/// Request `i` of the run uses `prompts.body(route, i)`; tasks interleave
+/// indices so every corpus kind sees the sequence it was designed for.
+/// Every body is built the same way for every corpus, outside the timed
+/// region (it still costs the client CPU). Latency
 /// and error counts cover requests *started* inside the measurement window.
 async fn run_load(client: &reqwest::Client, spec: LoadSpec) -> LoadResult {
     let LoadSpec {
         base_url,
         route,
-        corpus,
+        prompts,
         concurrency,
         rate,
         warmup,
@@ -470,7 +597,7 @@ async fn run_load(client: &reqwest::Client, spec: LoadSpec) -> LoadResult {
     for task in 0..concurrency {
         let client = client.clone();
         let url = url.clone();
-        let corpus = Arc::clone(&corpus);
+        let prompts = Arc::clone(&prompts);
         tasks.push(tokio::spawn(async move {
             let mut latencies = Vec::with_capacity(8192);
             let mut errors = 0u64;
@@ -485,7 +612,7 @@ async fn run_load(client: &reqwest::Client, spec: LoadSpec) -> LoadResult {
                 if Instant::now() >= end {
                     break;
                 }
-                let body = route.body(&corpus.prompt(i));
+                let body = prompts.body(route, i);
                 let t0 = Instant::now();
                 let ok = match client
                     .post(&url)
@@ -559,7 +686,10 @@ struct Row {
     scenario: String,
     policy: Option<String>,
     route: String,
-    size_bytes: usize,
+    input: InputSpec,
+    /// Serialized size of request 0. Every request of a cell has the same
+    /// size by construction (`tests/bench_corpus_test.rs` checks it).
+    body_bytes: usize,
     corpus: String,
     concurrency: usize,
     rate: f64,
@@ -577,7 +707,7 @@ struct Row {
     p99_us: u64,
     mean_us: f64,
     /// `mean_us` minus the direct mean on the same route for the same
-    /// size/corpus/concurrency/repeat, when that row was measured in this
+    /// input/corpus/concurrency/repeat, when that row was measured in this
     /// run. Means subtract; percentiles do not, so no such column exists
     /// for them.
     mean_minus_direct_us: Option<f64>,
@@ -592,19 +722,22 @@ struct Row {
     /// thousand requests it served over warmup and measurement. Startup is
     /// a small fixed cost included in the numerator.
     router_cpu_ms_per_1k_requests: Option<f64>,
-    /// CPU seconds the client and the mock workers used during the cell.
+    /// CPU seconds the client and the mock workers used during the cell:
+    /// router start, warmup, measurement and router stop.
     harness_cpu_s: f64,
+    /// Wall-clock seconds of the same interval.
+    harness_wall_s: f64,
+    /// `harness_cpu_s / harness_wall_s`: cores the client and the mock
+    /// workers kept busy on average. A hint only: the client can limit
+    /// throughput without keeping every runtime thread busy, especially at
+    /// low concurrency.
+    harness_cores: f64,
 }
 
-type CellKey = (String, usize, String, usize);
+type CellKey = (String, InputSpec, String, usize);
 
 fn cell_key(r: &Row) -> CellKey {
-    (
-        r.scenario.clone(),
-        r.size_bytes,
-        r.corpus.clone(),
-        r.concurrency,
-    )
+    (r.scenario.clone(), r.input, r.corpus.clone(), r.concurrency)
 }
 
 fn command_output(program: &str, args: &[&str]) -> Option<String> {
@@ -645,17 +778,18 @@ fn fmt_opt(v: Option<f64>, digits: usize) -> String {
 
 fn render_rows(rows: &[Row]) -> String {
     let mut out = String::new();
-    out.push_str("| rep | scenario | size | corpus | c | requests | errors | rps | p50 us | p90 us | p99 us | mean us | mean-direct us | hotspot | router cpu ms/1k req | router max rss MiB | harness cpu s |\n");
+    out.push_str("| rep | scenario | input | body bytes | corpus | c | requests | errors | rps | p50 us | p90 us | p99 us | mean us | mean-direct us | hotspot | router cpu ms/1k req | router max rss MiB | harness cpu s | harness cores |\n");
     out.push_str(
-        "|---:|---|---:|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|\n",
+        "|---:|---|---|---:|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|\n",
     );
     for r in rows {
         let rss = r.router.map(|u| u.max_rss_bytes as f64 / (1024.0 * 1024.0));
         out.push_str(&format!(
-            "| {} | {} | {} | {} | {} | {} | {} | {:.0} | {} | {} | {} | {:.1} | {} | {} | {} | {} | {:.1} |\n",
+            "| {} | {} | {} | {} | {} | {} | {} | {} | {:.0} | {} | {} | {} | {:.1} | {} | {} | {} | {} | {:.1} | {:.2} |\n",
             r.repeat,
             r.scenario,
-            r.size_bytes,
+            r.input.label(),
+            r.body_bytes,
             r.corpus,
             r.concurrency,
             r.requests,
@@ -670,6 +804,7 @@ fn render_rows(rows: &[Row]) -> String {
             fmt_opt(r.router_cpu_ms_per_1k_requests, 1),
             fmt_opt(rss, 1),
             r.harness_cpu_s,
+            r.harness_cores,
         ));
     }
     out
@@ -684,9 +819,11 @@ fn render_summary(rows: &[Row]) -> String {
         cells.entry(cell_key(r)).or_default().push(r);
     }
     let mut out = String::new();
-    out.push_str("| scenario | size | corpus | c | runs | rps (median) | p50 us | p99 us | mean us | mean spread | mean-direct us | hotspot | router cpu ms/1k req | router max rss MiB |\n");
-    out.push_str("|---|---:|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|\n");
-    for ((scenario, size, corpus, c), rs) in cells {
+    out.push_str("| scenario | input | body bytes | corpus | c | runs | rps (median) | p50 us | p99 us | mean us | mean spread | mean-direct us | hotspot | router cpu ms/1k req | router max rss MiB | harness cores |\n");
+    out.push_str(
+        "|---|---|---:|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|\n",
+    );
+    for ((scenario, input, corpus, c), rs) in cells {
         let med = |f: &dyn Fn(&Row) -> Option<f64>| -> Option<f64> {
             let mut v: Vec<f64> = rs.iter().filter_map(|r| f(r)).collect();
             if v.is_empty() {
@@ -705,9 +842,10 @@ fn render_summary(rows: &[Row]) -> String {
             None
         };
         out.push_str(&format!(
-            "| {} | {} | {} | {} | {} | {} | {} | {} | {:.1} | {} | {} | {} | {} | {} |\n",
+            "| {} | {} | {} | {} | {} | {} | {} | {} | {} | {:.1} | {} | {} | {} | {} | {} | {} |\n",
             scenario,
-            size,
+            input.label(),
+            rs[0].body_bytes,
             corpus,
             c,
             rs.len(),
@@ -725,6 +863,7 @@ fn render_summary(rows: &[Row]) -> String {
                 med(&|r| r.router.map(|u| u.max_rss_bytes as f64 / (1024.0 * 1024.0))),
                 1
             ),
+            fmt_opt(med(&|r| Some(r.harness_cores)), 2),
         ));
     }
     out
@@ -805,119 +944,124 @@ async fn router_overhead() {
         let shift = repeat % order.len();
         order.rotate_left(shift);
         for scenario in &order {
-            for &size in &cfg.sizes {
-                for &kind in &cfg.corpora {
-                    for &concurrency in &cfg.concurrency {
-                        let corpus = Arc::new(Corpus::new(kind, size));
-                        let label = format!(
-                            "r{}-{}-{}-{}-c{}",
-                            repeat,
-                            scenario.name,
-                            size,
-                            kind.name(),
-                            concurrency
-                        );
-                        eprintln!("== {label}");
-                        for w in &workers {
-                            w.reset_served();
+            for input in cfg.inputs(scenario.route) {
+                let prompts = Arc::new(input.prompts());
+                let body_bytes = prompts.body(scenario.route, 0).len();
+                for &concurrency in &cfg.concurrency {
+                    let label = format!(
+                        "r{}-{}-{}-{}-c{}",
+                        repeat,
+                        scenario.name,
+                        input.spec().label(),
+                        input.corpus_name(),
+                        concurrency
+                    );
+                    eprintln!("== {label}");
+                    for w in &workers {
+                        w.reset_served();
+                    }
+                    let spec = LoadSpec {
+                        base_url: String::new(),
+                        route: scenario.route,
+                        prompts: Arc::clone(&prompts),
+                        concurrency,
+                        rate: cfg.rate,
+                        warmup: cfg.warmup,
+                        measure: cfg.measure,
+                    };
+                    let cpu_before = self_cpu_s();
+                    let wall_before = Instant::now();
+                    let (load, usage) = match scenario.policy {
+                        None => (
+                            run_load(
+                                &client,
+                                LoadSpec {
+                                    base_url: worker_urls[0].clone(),
+                                    ..spec.clone()
+                                },
+                            )
+                            .await,
+                            None,
+                        ),
+                        Some(policy) => {
+                            let log_path = cfg.out_dir.join(format!("{label}.router.log"));
+                            let router = RouterProcess::start(
+                                &worker_urls,
+                                policy,
+                                &log_path,
+                                cfg.router_cpus.as_deref(),
+                                &client,
+                            )
+                            .await;
+                            let load = run_load(
+                                &client,
+                                LoadSpec {
+                                    base_url: router.url(),
+                                    ..spec.clone()
+                                },
+                            )
+                            .await;
+                            (load, Some(router.stop()))
                         }
-                        let spec = LoadSpec {
-                            base_url: String::new(),
-                            route: scenario.route,
-                            corpus,
-                            concurrency,
-                            rate: cfg.rate,
-                            warmup: cfg.warmup,
-                            measure: cfg.measure,
-                        };
-                        let cpu_before = self_cpu_s();
-                        let (load, usage) = match scenario.policy {
-                            None => (
-                                run_load(
-                                    &client,
-                                    LoadSpec {
-                                        base_url: worker_urls[0].clone(),
-                                        ..spec.clone()
-                                    },
-                                )
-                                .await,
-                                None,
-                            ),
-                            Some(policy) => {
-                                let log_path = cfg.out_dir.join(format!("{label}.router.log"));
-                                let router = RouterProcess::start(
-                                    &worker_urls,
-                                    policy,
-                                    &log_path,
-                                    cfg.router_cpus.as_deref(),
-                                    &client,
-                                )
-                                .await;
-                                let load = run_load(
-                                    &client,
-                                    LoadSpec {
-                                        base_url: router.url(),
-                                        ..spec.clone()
-                                    },
-                                )
-                                .await;
-                                (load, Some(router.stop()))
+                    };
+                    let harness_cpu_s = self_cpu_s() - cpu_before;
+                    let harness_wall_s = wall_before.elapsed().as_secs_f64();
+                    let served: Vec<u64> = workers.iter().map(|w| w.served()).collect();
+                    let total_served: u64 = served.iter().sum();
+                    let (worker_shares, hotspot) = if usage.is_some() && total_served > 0 {
+                        let shares: Vec<f64> = served
+                            .iter()
+                            .map(|&n| n as f64 / total_served as f64)
+                            .collect();
+                        let max = shares.iter().cloned().fold(0.0, f64::max);
+                        (Some(shares), Some(max * cfg.workers as f64))
+                    } else {
+                        (None, None)
+                    };
+                    let mean_us = if load.latencies_us.is_empty() {
+                        0.0
+                    } else {
+                        load.latencies_us.iter().sum::<u64>() as f64
+                            / load.latencies_us.len() as f64
+                    };
+                    let row = Row {
+                        repeat,
+                        scenario: scenario.name.to_string(),
+                        policy: scenario.policy.map(str::to_string),
+                        route: scenario.route.path().to_string(),
+                        input: input.spec(),
+                        body_bytes,
+                        corpus: input.corpus_name().to_string(),
+                        concurrency,
+                        rate: cfg.rate,
+                        workers: cfg.workers,
+                        warmup_secs: cfg.warmup.as_secs_f64(),
+                        measure_secs: load.measure_secs,
+                        requests: load.requests,
+                        errors: load.errors,
+                        served_requests: load.completed_ok,
+                        rps: load.requests as f64 / load.measure_secs,
+                        p50_us: percentile(&load.latencies_us, 0.50),
+                        p90_us: percentile(&load.latencies_us, 0.90),
+                        p99_us: percentile(&load.latencies_us, 0.99),
+                        mean_us,
+                        mean_minus_direct_us: None,
+                        worker_shares,
+                        hotspot,
+                        router: usage,
+                        router_cpu_ms_per_1k_requests: usage.map(|u| {
+                            if load.completed_ok == 0 {
+                                0.0
+                            } else {
+                                (u.user_cpu_s + u.sys_cpu_s) * 1000.0
+                                    / (load.completed_ok as f64 / 1000.0)
                             }
-                        };
-                        let harness_cpu_s = self_cpu_s() - cpu_before;
-                        let served: Vec<u64> = workers.iter().map(|w| w.served()).collect();
-                        let total_served: u64 = served.iter().sum();
-                        let (worker_shares, hotspot) = if usage.is_some() && total_served > 0 {
-                            let shares: Vec<f64> = served
-                                .iter()
-                                .map(|&n| n as f64 / total_served as f64)
-                                .collect();
-                            let max = shares.iter().cloned().fold(0.0, f64::max);
-                            (Some(shares), Some(max * cfg.workers as f64))
-                        } else {
-                            (None, None)
-                        };
-                        let mean_us = if load.latencies_us.is_empty() {
-                            0.0
-                        } else {
-                            load.latencies_us.iter().sum::<u64>() as f64
-                                / load.latencies_us.len() as f64
-                        };
-                        let row = Row {
-                            repeat,
-                            scenario: scenario.name.to_string(),
-                            policy: scenario.policy.map(str::to_string),
-                            route: scenario.route.path().to_string(),
-                            size_bytes: size,
-                            corpus: kind.name().to_string(),
-                            concurrency,
-                            rate: cfg.rate,
-                            workers: cfg.workers,
-                            warmup_secs: cfg.warmup.as_secs_f64(),
-                            measure_secs: load.measure_secs,
-                            requests: load.requests,
-                            errors: load.errors,
-                            served_requests: load.completed_ok,
-                            rps: load.requests as f64 / load.measure_secs,
-                            p50_us: percentile(&load.latencies_us, 0.50),
-                            p90_us: percentile(&load.latencies_us, 0.90),
-                            p99_us: percentile(&load.latencies_us, 0.99),
-                            mean_us,
-                            mean_minus_direct_us: None,
-                            worker_shares,
-                            hotspot,
-                            router: usage,
-                            router_cpu_ms_per_1k_requests: usage.map(|u| {
-                                if load.completed_ok == 0 {
-                                    0.0
-                                } else {
-                                    (u.user_cpu_s + u.sys_cpu_s) * 1000.0
-                                        / (load.completed_ok as f64 / 1000.0)
-                                }
-                            }),
-                            harness_cpu_s,
-                        };
-                        eprintln!(
+                        }),
+                        harness_cpu_s,
+                        harness_wall_s,
+                        harness_cores: harness_cpu_s / harness_wall_s,
+                    };
+                    eprintln!(
                             "   requests={} errors={} rps={:.0} p50={}us p99={}us mean={:.1}us hotspot={} router_cpu_ms_per_1k={}",
                             row.requests,
                             row.errors,
@@ -928,8 +1072,7 @@ async fn router_overhead() {
                             fmt_opt(row.hotspot, 2),
                             fmt_opt(row.router_cpu_ms_per_1k_requests, 1)
                         );
-                        rows.push(row);
-                    }
+                    rows.push(row);
                 }
             }
         }
@@ -941,7 +1084,7 @@ async fn router_overhead() {
 
     // Fill in the mean delta against the direct row on the same route,
     // measured in the same repeat.
-    let direct: BTreeMap<(usize, String, usize, String, usize), f64> = rows
+    let direct: BTreeMap<(usize, String, InputSpec, String, usize), f64> = rows
         .iter()
         .filter(|r| r.policy.is_none())
         .map(|r| {
@@ -949,7 +1092,7 @@ async fn router_overhead() {
                 (
                     r.repeat,
                     r.route.clone(),
-                    r.size_bytes,
+                    r.input,
                     r.corpus.clone(),
                     r.concurrency,
                 ),
@@ -963,7 +1106,7 @@ async fn router_overhead() {
                 .get(&(
                     r.repeat,
                     r.route.clone(),
-                    r.size_bytes,
+                    r.input,
                     r.corpus.clone(),
                     r.concurrency,
                 ))

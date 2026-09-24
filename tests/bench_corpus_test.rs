@@ -6,11 +6,13 @@
 mod common;
 
 use common::bench_corpus::{
-    chat, chat_with_session, completion_ids, completion_text, to_chat_request,
-    to_completion_request, Corpus, CorpusKind, HOT_SET_SIZE, LONG_SHARED_PREFIX_TAIL_BYTES,
+    body_pool_len, chat, chat_with_session, completion_ids, completion_text, to_chat_request,
+    to_completion_request, Corpus, CorpusKind, IdCorpus, BODY_POOL_MAX_BYTES, BODY_POOL_SIZE,
+    HOT_SET_SIZE, LONG_SHARED_PREFIX_TAIL_BYTES, LONG_SIZES, PROMPT_ID_COUNTS, PROMPT_ID_RANGE,
     SHORT_SHARED_PREFIX_MAX_BYTES, SIZES,
 };
 use common::bench_mock::BenchMockWorker;
+use common::routing_edge::json_like_prompt;
 use vllm_router_rs::protocols::spec::{GenerationRequest, PromptInput};
 
 #[test]
@@ -21,7 +23,7 @@ fn every_corpus_builds_prompts_of_the_requested_size() {
             for i in [0usize, 1, 9, 10, 63, 64, 65, 1000] {
                 let prompt = corpus.prompt(i);
                 assert_eq!(prompt.len(), size, "{} size={} i={}", kind.name(), size, i);
-                assert!(prompt.is_ascii());
+                assert_eq!(prompt.is_ascii(), kind != CorpusKind::Utf8Hot64);
             }
         }
     }
@@ -160,4 +162,85 @@ async fn bench_mock_worker_answers_health_and_generation_routes() {
         .expect("chat");
     assert!(resp.status().is_success());
     worker.stop().await;
+}
+
+#[test]
+fn long_prompts_are_exact_and_the_body_pool_is_bounded() {
+    // Up to 16 KiB the pool is unchanged, so the corpora behind published
+    // numbers are byte-identical; longer prompts get a pool within budget.
+    for size in SIZES {
+        assert_eq!(body_pool_len(size), BODY_POOL_SIZE);
+    }
+    for size in LONG_SIZES {
+        assert!(
+            body_pool_len(size) * size <= BODY_POOL_MAX_BYTES,
+            "{size} B"
+        );
+    }
+    let size = *LONG_SIZES.last().expect("long sizes");
+    for kind in [CorpusKind::Hot64, CorpusKind::Utf8Hot64] {
+        let corpus = Corpus::new(kind, size);
+        for i in [0usize, 1, 63, 64] {
+            assert_eq!(corpus.prompt(i).len(), size, "{} i={}", kind.name(), i);
+        }
+        assert_eq!(corpus.prompt(3), corpus.prompt(3 + HOT_SET_SIZE));
+    }
+}
+
+#[test]
+fn utf8_hot64_is_multibyte_and_serializes_without_escapes() {
+    let envelope = completion_text("").to_string().len();
+    for size in SIZES {
+        let corpus = Corpus::new(CorpusKind::Utf8Hot64, size);
+        let prompt = corpus.prompt(5);
+        assert!(prompt.starts_with("[hot 05] "));
+        assert!(prompt.chars().count() < prompt.len(), "size={size}");
+        assert_eq!(completion_text(&prompt).to_string().len(), envelope + size);
+    }
+}
+
+#[test]
+fn id_prompts_have_a_fixed_serialized_size() {
+    let envelope = completion_ids(&[]).to_string().len();
+    for n in PROMPT_ID_COUNTS {
+        let corpus = IdCorpus::new(n);
+        assert_eq!(corpus.ids_per_prompt(), n);
+        assert_ne!(corpus.prompt_ids(0), corpus.prompt_ids(1));
+        for i in [0usize, 1, 63] {
+            let ids = corpus.prompt_ids(i);
+            assert_eq!(ids.len(), n);
+            assert!(ids.iter().all(|id| PROMPT_ID_RANGE.contains(id)));
+            // Five digits and a comma per id, minus the last comma.
+            let body = completion_ids(ids).to_string();
+            assert_eq!(body.len(), envelope + 6 * n - 1, "{n} ids, prompt {i}");
+            let req = to_completion_request(&completion_ids(ids));
+            assert!(matches!(req.prompt, PromptInput::IntArray(ref v) if v.len() == n));
+        }
+    }
+}
+
+#[test]
+fn bodies_in_a_cell_have_equal_size() {
+    // The harness reports one `body_bytes` per cell, taken from request 0.
+    for kind in CorpusKind::ALL {
+        for size in SIZES {
+            let corpus = Corpus::new(kind, size);
+            let completion = completion_text(&corpus.prompt(0)).to_string().len();
+            let chat_len = chat(None, &corpus.prompt(0)).to_string().len();
+            for i in [1usize, 9, 10, 63, 64, 65, 1000] {
+                let prompt = corpus.prompt(i);
+                assert_eq!(completion_text(&prompt).to_string().len(), completion);
+                assert_eq!(chat(None, &prompt).to_string().len(), chat_len);
+            }
+        }
+    }
+}
+
+#[test]
+fn json_like_prompt_carries_one_user_field() {
+    for size in [16 * 1024, 1024 * 1024] {
+        let prompt = json_like_prompt(size);
+        assert_eq!(prompt.len(), size);
+        assert_eq!(prompt.matches("\"user\": \"u-1\"").count(), 1);
+    }
 }

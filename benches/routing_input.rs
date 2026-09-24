@@ -20,29 +20,57 @@
 //!   counts; raw text uses about four bytes per token. This is input for the discussion on
 //!   token-id routing keys (PR #237); it does not exercise any router code
 //!   path beyond the tree.
+//! - `edge/*`: router edge cases, from `tests/common/routing_edge.rs`. Each
+//!   case asserts the branch it is named after before it is timed, and
+//!   `tests/routing_edge_cases_test.rs` asserts the same cases in CI.
+//!   - `edge/cache_aware/{case}`: one `select_worker` from the case's
+//!     starting state, restored untimed before every call because routing
+//!     inserts the prompt: long prompts (128 KiB to 1 MiB) as a full hit or
+//!     cold, 45% and 55% shared around `cache_threshold`, imbalanced load,
+//!     long CJK keys.
+//!   - `edge/long_input/{deserialize,extract,serialize}/{completion,chat}/{size}`:
+//!     the body work the router does per long request besides routing:
+//!     `axum::Json::from_bytes` into the typed request (what the handler's
+//!     extractor runs), the routing-text copy, and the `serde_json::to_vec`
+//!     that forwards it; `deserialize/{completion,chat}_utf8/{size}` parse
+//!     CJK text of the same sizes.
+//!   - `edge/rendezvous/{body,header}/{size}`: long prompts without and with
+//!     an `x-session-id` header; `json_like_prompt/{size}` has a `"user"`
+//!     field in the prompt text.
+//!   - `edge/token_ids/{deserialize,extract}/ids{n}`: pre-tokenized prompts,
+//!     parsed the same way.
+//!   - `edge/workers/{rendezvous,cache_aware}/{n}`: 1 to 64 workers.
 //!
-//! Inputs come from `tests/common/bench_corpus.rs` (seeded, offline), so the
-//! benchmark needs no network and no tokenizer file.
+//! Inputs come from `tests/common/bench_corpus.rs` and
+//! `tests/common/routing_edge.rs` (seeded, offline), so the benchmark needs
+//! no network and no tokenizer file.
 //!
-//! Run with: `cargo bench --bench routing_input`
+//! Run with: `cargo bench --bench routing_input` (only the edge cases:
+//! `cargo bench --bench routing_input -- edge/`)
 
+use axum::Json;
 use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
-use std::sync::Arc;
 use std::time::{Duration, Instant};
-use vllm_router_rs::core::{BasicWorker, Worker, WorkerType};
 use vllm_router_rs::policies::{
     CacheAwareConfig, CacheAwarePolicy, LoadBalancingPolicy, RendezvousHashPolicy,
 };
-use vllm_router_rs::protocols::spec::GenerationRequest;
+use vllm_router_rs::protocols::spec::{
+    ChatCompletionRequest, CompletionRequest, GenerationRequest,
+};
 use vllm_router_rs::tree::Tree;
 
 #[path = "../tests/common/mod.rs"]
 mod common;
 use common::bench_corpus::{
-    chat, completion_text, seeded_text, to_chat_request, to_completion_request, Corpus, CorpusKind,
-    SEED, SIZES,
+    chat, completion_ids, completion_text, seeded_ids, seeded_text, seeded_utf8_text,
+    to_chat_request, to_completion_request, Corpus, CorpusKind, LONG_SIZES, PROMPT_ID_COUNTS, SEED,
+    SIZES,
+};
+use common::routing_edge::{
+    cache_aware_cases, json_like_prompt, rendezvous_pair, session_headers, size_label, workers,
+    CacheAwareFixture,
 };
 
 /// A routing-key builder for one candidate encoding.
@@ -51,25 +79,10 @@ type KeyFn = Box<dyn Fn(u64) -> String>;
 const WORKER_COUNT: usize = 4;
 const TOKEN_COUNTS: [usize; 4] = [128, 512, 2048, 8192];
 const VOCAB: u32 = 32_000;
-
-fn size_label(size: usize) -> String {
-    if size >= 1024 {
-        format!("{}KiB", size / 1024)
-    } else {
-        format!("{size}B")
-    }
-}
-
-fn workers() -> Vec<Arc<dyn Worker>> {
-    (0..WORKER_COUNT)
-        .map(|i| {
-            Arc::new(BasicWorker::new(
-                format!("http://127.0.0.1:{}", 30_000 + i),
-                WorkerType::Regular,
-            )) as Arc<dyn Worker>
-        })
-        .collect()
-}
+/// Worker counts for `edge/workers`.
+const EDGE_WORKER_COUNTS: [usize; 4] = [1, 4, 16, 64];
+/// Inputs at or above this size get criterion's minimum sample count.
+const LARGE_INPUT_BYTES: usize = 512 * 1024;
 
 fn bench_extract_text(c: &mut Criterion) {
     let mut group = c.benchmark_group("routing_key/extract_text_for_routing");
@@ -106,7 +119,7 @@ fn bench_extract_text(c: &mut Criterion) {
 
 fn bench_policy_select(c: &mut Criterion) {
     let mut group = c.benchmark_group("policy");
-    let workers = workers();
+    let workers = workers(WORKER_COUNT);
     for size in SIZES {
         let corpus = Corpus::new(CorpusKind::Hot64, size);
         let prompts: Vec<String> = (0..64).map(|i| corpus.prompt(i)).collect();
@@ -268,10 +281,225 @@ fn bench_key_format(c: &mut Criterion) {
     group.finish();
 }
 
+/// Apply the edge groups' timing: short warmup and measurement, and the
+/// minimum sample count for inputs of `LARGE_INPUT_BYTES` or more.
+fn edge_timing<M: criterion::measurement::Measurement>(
+    group: &mut criterion::BenchmarkGroup<'_, M>,
+    input_bytes: usize,
+) {
+    group
+        .warm_up_time(Duration::from_secs(1))
+        .measurement_time(Duration::from_secs(5))
+        .sample_size(if input_bytes >= LARGE_INPUT_BYTES {
+            10
+        } else {
+            50
+        });
+}
+
+fn bench_edge_cache_aware(c: &mut Criterion) {
+    let mut group = c.benchmark_group("edge/cache_aware");
+    for case in cache_aware_cases().into_iter().filter(|case| case.bench) {
+        let built = case.build();
+        assert_eq!(
+            built.fixture.select(&built.probe),
+            Some(case.expect),
+            "{} must take its intended branch",
+            case.name
+        );
+        edge_timing(&mut group, case.key_bytes);
+        group.throughput(Throughput::Elements(1));
+        group.bench_function(BenchmarkId::from_parameter(&case.name), |b| {
+            b.iter_custom(|iters| {
+                let mut total = Duration::ZERO;
+                for _ in 0..iters {
+                    built.fixture.reset();
+                    let t0 = Instant::now();
+                    black_box(built.fixture.select(&built.probe));
+                    total += t0.elapsed();
+                }
+                total
+            });
+        });
+    }
+    group.finish();
+}
+
+fn bench_edge_long_input(c: &mut Criterion) {
+    let mut group = c.benchmark_group("edge/long_input");
+    for size in LONG_SIZES {
+        let label = size_label(size);
+        edge_timing(&mut group, size);
+        let prompt = seeded_text(SEED ^ size as u64, size);
+        let completion_body = serde_json::to_vec(&completion_text(&prompt)).expect("json");
+        let chat_body = serde_json::to_vec(&chat(None, &prompt)).expect("json");
+        eprintln!(
+            "long_input/{label}: prompt {size} bytes, completion body {} bytes, chat body {} bytes",
+            completion_body.len(),
+            chat_body.len()
+        );
+        let completion: CompletionRequest =
+            serde_json::from_slice(&completion_body).expect("completion");
+        let chat_req: ChatCompletionRequest = serde_json::from_slice(&chat_body).expect("chat");
+
+        group.throughput(Throughput::Bytes(completion_body.len() as u64));
+        group.bench_function(format!("deserialize/completion/{label}"), |b| {
+            b.iter(|| {
+                black_box(Json::<CompletionRequest>::from_bytes(&completion_body).expect("parse"))
+            });
+        });
+        group.bench_function(format!("serialize/completion/{label}"), |b| {
+            b.iter(|| black_box(serde_json::to_vec(&completion).expect("json")));
+        });
+        group.throughput(Throughput::Bytes(chat_body.len() as u64));
+        group.bench_function(format!("deserialize/chat/{label}"), |b| {
+            b.iter(|| {
+                black_box(Json::<ChatCompletionRequest>::from_bytes(&chat_body).expect("parse"))
+            });
+        });
+        group.bench_function(format!("serialize/chat/{label}"), |b| {
+            b.iter(|| black_box(serde_json::to_vec(&chat_req).expect("json")));
+        });
+
+        // As in `routing_key/*`: the returned text is dropped inside the
+        // timed call, as the router drops it.
+        group.throughput(Throughput::Bytes(size as u64));
+        group.bench_function(format!("extract/completion/{label}"), |b| {
+            b.iter(|| black_box(completion.extract_text_for_routing()));
+        });
+        group.throughput(Throughput::Elements(1));
+        group.bench_function(format!("extract/chat/{label}"), |b| {
+            b.iter(|| black_box(chat_req.extract_text_for_routing()));
+        });
+
+        // The same sizes of CJK text. Parsing depends on the characters,
+        // not only the bytes: the untagged `PromptInput` tries its string
+        // variant last, and every failed variant formats the whole prompt
+        // into its error message, which is much slower for non-ASCII text.
+        let utf8_prompt = seeded_utf8_text(SEED ^ size as u64, size);
+        let utf8_completion = serde_json::to_vec(&completion_text(&utf8_prompt)).expect("json");
+        let utf8_chat = serde_json::to_vec(&chat(None, &utf8_prompt)).expect("json");
+        group.throughput(Throughput::Bytes(utf8_completion.len() as u64));
+        group.bench_function(format!("deserialize/completion_utf8/{label}"), |b| {
+            b.iter(|| {
+                black_box(Json::<CompletionRequest>::from_bytes(&utf8_completion).expect("parse"))
+            });
+        });
+        group.throughput(Throughput::Bytes(utf8_chat.len() as u64));
+        group.bench_function(format!("deserialize/chat_utf8/{label}"), |b| {
+            b.iter(|| {
+                black_box(Json::<ChatCompletionRequest>::from_bytes(&utf8_chat).expect("parse"))
+            });
+        });
+    }
+    group.finish();
+}
+
+fn bench_edge_rendezvous(c: &mut Criterion) {
+    let mut group = c.benchmark_group("edge/rendezvous");
+    let policy = RendezvousHashPolicy::new();
+    let workers = workers(WORKER_COUNT);
+    let session = session_headers("edge-session");
+    group.throughput(Throughput::Elements(1));
+    for size in LONG_SIZES {
+        let label = size_label(size);
+        edge_timing(&mut group, size);
+        // A pair that hashes to different workers without a header; the
+        // benchmark routes the first of them.
+        let (prompt, _) = rendezvous_pair(size);
+        group.bench_function(format!("body/{label}"), |b| {
+            b.iter(|| black_box(policy.select_worker_with_headers(&workers, Some(&prompt), None)));
+        });
+        group.bench_function(format!("header/{label}"), |b| {
+            b.iter(|| {
+                black_box(policy.select_worker_with_headers(
+                    &workers,
+                    Some(&prompt),
+                    Some(&session),
+                ))
+            });
+        });
+    }
+    for size in [16 * 1024, 1024 * 1024] {
+        edge_timing(&mut group, size);
+        let prompt = json_like_prompt(size);
+        group.bench_function(format!("json_like_prompt/{}", size_label(size)), |b| {
+            b.iter(|| black_box(policy.select_worker(&workers, Some(&prompt))));
+        });
+    }
+    group.finish();
+}
+
+fn bench_edge_token_ids(c: &mut Criterion) {
+    let mut group = c.benchmark_group("edge/token_ids");
+    for n in PROMPT_ID_COUNTS {
+        let body = serde_json::to_vec(&completion_ids(&seeded_ids(SEED, n))).expect("json");
+        eprintln!("token_ids/ids{n}: body {} bytes", body.len());
+        edge_timing(&mut group, body.len());
+        group.throughput(Throughput::Bytes(body.len() as u64));
+        group.bench_function(format!("deserialize/ids{n}"), |b| {
+            b.iter(|| black_box(Json::<CompletionRequest>::from_bytes(&body).expect("parse")));
+        });
+        let req: CompletionRequest = serde_json::from_slice(&body).expect("parse");
+        group.throughput(Throughput::Elements(1));
+        group.bench_function(format!("extract/ids{n}"), |b| {
+            b.iter(|| black_box(req.extract_text_for_routing()));
+        });
+    }
+    group.finish();
+}
+
+fn bench_edge_workers(c: &mut Criterion) {
+    let mut group = c.benchmark_group("edge/workers");
+    let corpus = Corpus::new(CorpusKind::Hot64, 2048);
+    let prompts: Vec<String> = (0..64).map(|i| corpus.prompt(i)).collect();
+    edge_timing(&mut group, 2048);
+    group.throughput(Throughput::Elements(1));
+    let policy = RendezvousHashPolicy::new();
+    for n in EDGE_WORKER_COUNTS {
+        let workers = workers(n);
+        let mut i = 0usize;
+        group.bench_function(format!("rendezvous/{n}"), |b| {
+            b.iter(|| {
+                let p = &prompts[i % prompts.len()];
+                i += 1;
+                black_box(policy.select_worker(&workers, Some(p)))
+            });
+        });
+
+        // Hot prompts warmed round-robin over the workers, no load: every
+        // request is a hit on its own tenant and re-inserting a known key
+        // leaves the tree unchanged, so no reset is needed.
+        let warm = prompts
+            .iter()
+            .enumerate()
+            .map(|(k, p)| (k % n, p.clone()))
+            .collect();
+        let fixture = CacheAwareFixture::new(warm, &vec![0; n], &[]);
+        for (k, p) in prompts.iter().enumerate() {
+            assert_eq!(fixture.select(p), Some(k % n), "{n} workers, prompt {k}");
+        }
+        let mut j = 0usize;
+        group.bench_function(format!("cache_aware/{n}"), |b| {
+            b.iter(|| {
+                let p = &prompts[j % prompts.len()];
+                j += 1;
+                black_box(fixture.select(p))
+            });
+        });
+    }
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_extract_text,
     bench_policy_select,
-    bench_key_format
+    bench_key_format,
+    bench_edge_cache_aware,
+    bench_edge_long_input,
+    bench_edge_rendezvous,
+    bench_edge_token_ids,
+    bench_edge_workers
 );
 criterion_main!(benches);
