@@ -241,7 +241,7 @@ impl Corpus {
                 .map(|j| {
                     let marker = format!("[hot {j:02}] ");
                     let body = utf8_filler(&mut rng, size_bytes - marker.len());
-                    marker + &body
+                    marker + body.as_str()
                 })
                 .collect();
             (hot, Vec::new(), String::new(), String::new())
