@@ -82,6 +82,23 @@ async fn grpc_frontend_cache_parity_metrics_streaming_and_retries() {
         .unwrap();
     assert_eq!(on.tokenizer_cache_stats().unwrap().misses, 4);
 
+    for salt in ["tenant-a", "tenant-b"] {
+        let mut salted = request.clone();
+        salted.other.insert("cache_salt".into(), json!(salt));
+        let before = on.tokenizer_cache_stats().unwrap();
+        for _ in 0..2 {
+            let prepared = on.prepare(salted.clone()).await.unwrap();
+            assert_eq!(prepared.tokenized.token_ids, expected.tokenized.token_ids);
+            let response = on.dispatch(&worker.grpc_url, prepared).await;
+            assert_eq!(response.status(), 200);
+            to_bytes(response.into_body(), usize::MAX).await.unwrap();
+            assert_eq!(worker.captured().last().unwrap().cache_salt, salt);
+        }
+        let after = on.tokenizer_cache_stats().unwrap();
+        assert_eq!(after.misses - before.misses, 1);
+        assert_eq!(after.hits - before.hits, 1);
+    }
+
     // Cache hits must not skip validation.
     let before = on.tokenizer_cache_stats().unwrap();
     let mut invalid = request.clone();

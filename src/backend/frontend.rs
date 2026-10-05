@@ -59,7 +59,7 @@ impl EngineFrontend {
     ) -> anyhow::Result<Self> {
         Ok(Self {
             tokenizer: Arc::new(TokenizerCache::with_encoding_cache(config)?),
-            grpc: GrpcEngineBackend::with_timeouts(Duration::from_secs(10), request_timeout),
+            ..Self::with_request_timeout(request_timeout)
         })
     }
 

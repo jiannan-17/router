@@ -61,7 +61,7 @@ fn percentile(sorted: &[f64], fraction: f64) -> f64 {
 async fn grpc_frontend_l0_overhead() {
     let sizes = settings("VLLM_ROUTER_BENCH_SIZES", "200,16384,131072");
     let concurrencies = settings("VLLM_ROUTER_BENCH_CONCURRENCY", "1,8");
-    let seconds = settings("VLLM_ROUTER_BENCH_SECONDS", "2")[0];
+    let seconds = settings("VLLM_ROUTER_BENCH_MEASURE_SECS", "2")[0];
     let model = Arc::new(model_fixture());
     let worker = MockVllmRsServer::spawn_with_state(MockVllmRs {
         capture_limit: 0,

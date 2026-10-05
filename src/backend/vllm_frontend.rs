@@ -85,7 +85,11 @@ impl VllmFrontend {
         let t1 = Instant::now();
         let ids = self
             .encoder
-            .encode(rendered.prompt, request.add_special_tokens)
+            .encode(
+                rendered.prompt,
+                request.add_special_tokens,
+                request.cache_salt.as_deref(),
+            )
             .map_err(|error| vllm_chat::Error::ChatTemplate(error.to_string()))?;
         let encode_ms = t1.elapsed().as_secs_f64() * 1000.0;
         Ok((ids, template_ms, encode_ms))

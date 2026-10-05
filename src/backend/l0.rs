@@ -15,6 +15,7 @@ use crate::tokenizer::TokenizerCacheConfig;
 pub(crate) struct EncodingKey {
     instance: u64,
     add_special_tokens: bool,
+    cache_salt: Option<String>,
     text: String,
 }
 
@@ -43,6 +44,7 @@ impl PromptEncoder {
         &self,
         prompt: Prompt,
         add_special_tokens: bool,
+        cache_salt: Option<&str>,
     ) -> vllm_tokenizer::Result<Vec<u32>> {
         let text = match prompt {
             Prompt::TokenIds(ids) => return Ok(ids),
@@ -54,6 +56,7 @@ impl PromptEncoder {
         let key = EncodingKey {
             instance: self.instance,
             add_special_tokens,
+            cache_salt: cache_salt.map(str::to_owned),
             text,
         };
         cache.get_or_encode(
@@ -62,6 +65,7 @@ impl PromptEncoder {
             |ids| {
                 entry_overhead_bytes::<EncodingKey, Vec<u32>>()
                     + key.text.len()
+                    + key.cache_salt.as_ref().map_or(0, String::len)
                     + size_of::<Vec<u32>>()
                     + ids.len() * size_of::<u32>()
             },
@@ -171,7 +175,9 @@ mod tests {
     }
 
     fn encode(encoder: &PromptEncoder, text: &str, special: bool) -> Vec<u32> {
-        encoder.encode(Prompt::Text(text.into()), special).unwrap()
+        encoder
+            .encode(Prompt::Text(text.into()), special, None)
+            .unwrap()
     }
 
     #[test]
@@ -202,15 +208,67 @@ mod tests {
     }
 
     #[test]
+    fn cache_salt_isolates_entries_and_counts_retained_bytes() {
+        let cache = Arc::new(FrontendCache::new(Default::default()).unwrap());
+        let inner = CountingTokenizer::new(0);
+        let encoder = PromptEncoder::new(inner.clone(), Some(cache.clone()));
+        let expected = encode(
+            &PromptEncoder::new(CountingTokenizer::new(0), None),
+            "Hello",
+            false,
+        );
+        let mut unsalted_bytes = 0;
+        for salt in [None, Some(""), Some("tenant-a"), Some("tenant-b")] {
+            let before = cache.stats().bytes;
+            for _ in 0..2 {
+                assert_eq!(
+                    encoder
+                        .encode(Prompt::Text("Hello".into()), false, salt)
+                        .unwrap(),
+                    expected
+                );
+            }
+            let retained = cache.stats().bytes - before;
+            if salt.is_none() {
+                unsalted_bytes = retained;
+            }
+            assert_eq!(retained, unsalted_bytes + salt.map_or(0, str::len));
+        }
+        let stats = cache.stats();
+        assert_eq!((stats.hits, stats.misses, stats.entries), (4, 4, 4));
+        assert_eq!(inner.calls.load(Ordering::Relaxed), 4);
+
+        let small = Arc::new(
+            FrontendCache::new(TokenizerCacheConfig {
+                max_entry_bytes: unsalted_bytes,
+                ..Default::default()
+            })
+            .unwrap(),
+        );
+        let encoder = PromptEncoder::new(inner, Some(small.clone()));
+        assert_eq!(encode(&encoder, "Hello", false), expected);
+        assert_eq!(
+            encoder
+                .encode(Prompt::Text("Hello".into()), false, Some("tenant-a"))
+                .unwrap(),
+            expected
+        );
+        assert_eq!(small.stats().oversized, 1);
+        assert_eq!(small.stats().bytes, unsalted_bytes);
+    }
+
+    #[test]
     fn errors_and_token_ids_are_never_cached() {
         let cache = Arc::new(FrontendCache::new(Default::default()).unwrap());
         let inner = CountingTokenizer::new(0);
         let encoder = PromptEncoder::new(inner.clone(), Some(cache.clone()));
         for _ in 0..2 {
-            assert!(encoder.encode(Prompt::Text("fail".into()), false).is_err());
+            assert!(encoder
+                .encode(Prompt::Text("fail".into()), false, None)
+                .is_err());
             assert_eq!(
                 encoder
-                    .encode(Prompt::TokenIds(vec![5, 4, 3]), true)
+                    .encode(Prompt::TokenIds(vec![5, 4, 3]), true, Some("tenant-a"))
                     .unwrap(),
                 [5, 4, 3]
             );

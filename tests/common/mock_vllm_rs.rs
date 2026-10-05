@@ -25,6 +25,7 @@ pub struct CapturedGrpcGenerate {
     pub token_ids: Vec<u32>,
     pub had_text_prompt: bool,
     pub model: String,
+    pub cache_salt: String,
 }
 
 #[derive(Clone)]
@@ -147,6 +148,7 @@ impl Inference for MockVllmRs {
                     token_ids: token_ids.clone(),
                     had_text_prompt,
                     model: req.model,
+                    cache_salt: req.kv.map(|kv| kv.cache_salt).unwrap_or_default(),
                 });
             }
         }
