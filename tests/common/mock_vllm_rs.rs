@@ -7,6 +7,7 @@
 #![allow(dead_code)]
 
 use std::pin::Pin;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use tokio::sync::mpsc;
@@ -30,6 +31,8 @@ pub struct CapturedGrpcGenerate {
 pub struct MockVllmRs {
     pub captured: Arc<Mutex<Vec<CapturedGrpcGenerate>>>,
     pub reply_text: String,
+    pub capture_limit: usize,
+    pub failures_remaining: Arc<AtomicUsize>,
 }
 
 impl Default for MockVllmRs {
@@ -37,6 +40,8 @@ impl Default for MockVllmRs {
         Self {
             captured: Arc::new(Mutex::new(Vec::new())),
             reply_text: "hello from worker".to_string(),
+            capture_limit: usize::MAX,
+            failures_remaining: Arc::new(AtomicUsize::new(0)),
         }
     }
 }
@@ -50,7 +55,10 @@ pub struct MockVllmRsServer {
 
 impl MockVllmRsServer {
     pub async fn spawn() -> Self {
-        let state = MockVllmRs::default();
+        Self::spawn_with_state(MockVllmRs::default()).await
+    }
+
+    pub async fn spawn_with_state(state: MockVllmRs) -> Self {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let incoming = tokio_stream::wrappers::TcpListenerStream::new(listener);
@@ -132,11 +140,24 @@ impl Inference for MockVllmRs {
             Some(generate_request::Prompt::Text(_)) => (Vec::new(), true),
             None => (Vec::new(), false),
         };
-        self.captured.lock().unwrap().push(CapturedGrpcGenerate {
-            token_ids: token_ids.clone(),
-            had_text_prompt,
-            model: req.model,
-        });
+        {
+            let mut captured = self.captured.lock().unwrap();
+            if captured.len() < self.capture_limit {
+                captured.push(CapturedGrpcGenerate {
+                    token_ids: token_ids.clone(),
+                    had_text_prompt,
+                    model: req.model,
+                });
+            }
+        }
+
+        if self
+            .failures_remaining
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_sub(1))
+            .is_ok()
+        {
+            return Err(Status::unavailable("retry test"));
+        }
 
         let (tx, rx) = mpsc::channel(4);
         let reply = self.reply_text.clone();

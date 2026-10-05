@@ -12,6 +12,7 @@ use axum::response::Response;
 use super::grpc::GrpcEngineBackend;
 use super::preprocess::{tokenize_chat_request_timed, FrontendHandle, TokenizeOut, TokenizerCache};
 use crate::protocols::spec::ChatCompletionRequest;
+use crate::tokenizer::{TokenizerCacheConfig, TokenizerCacheStats};
 
 /// Tokenized chat ready for policy + `dispatch`.
 #[derive(Clone)]
@@ -49,6 +50,29 @@ impl EngineFrontend {
             tokenizer: Arc::new(TokenizerCache::new()),
             grpc: GrpcEngineBackend::with_timeouts(Duration::from_secs(10), request_timeout),
         }
+    }
+
+    /// Opt-in L0 with one entry/byte budget across all loaded models.
+    pub fn with_tokenizer_cache(
+        request_timeout: Duration,
+        config: TokenizerCacheConfig,
+    ) -> anyhow::Result<Self> {
+        Ok(Self {
+            tokenizer: Arc::new(TokenizerCache::with_encoding_cache(config)?),
+            grpc: GrpcEngineBackend::with_timeouts(Duration::from_secs(10), request_timeout),
+        })
+    }
+
+    pub(crate) fn from_env(request_timeout: Duration) -> anyhow::Result<Self> {
+        match super::l0::config_from_env()? {
+            Some(config) => Self::with_tokenizer_cache(request_timeout, config),
+            None => Ok(Self::with_request_timeout(request_timeout)),
+        }
+    }
+
+    /// Aggregate L0 counters and occupancy across loaded models, if enabled.
+    pub fn tokenizer_cache_stats(&self) -> Option<TokenizerCacheStats> {
+        self.tokenizer.encoding_cache_stats()
     }
 
     /// Tests only: bypass model loading by returning these fake prompt ids.
