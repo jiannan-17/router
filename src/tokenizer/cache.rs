@@ -247,9 +247,6 @@ pub(crate) struct EncodeCache<K: Hash + Eq, V> {
 }
 
 impl<K: Hash + Eq, V> EncodeCache<K, V> {
-    /// Create a cache sized by `config`.
-    ///
-    /// Returns an error if `config` fails [`TokenizerCacheConfig::validate`].
     pub(crate) fn new(config: TokenizerCacheConfig) -> Result<Self> {
         config.validate()?;
         let capacity =
@@ -257,9 +254,7 @@ impl<K: Hash + Eq, V> EncodeCache<K, V> {
         Ok(Self {
             config,
             state: Mutex::new(CacheState {
-                // `sparse` grows the map on demand instead of preallocating
-                // `max_entries` slots, which matters when the byte budget is
-                // the binding limit.
+                // Grow on demand; the byte budget may limit capacity first.
                 lru: LruCache::sparse(capacity),
                 bytes: 0,
             }),
@@ -270,22 +265,18 @@ impl<K: Hash + Eq, V> EncodeCache<K, V> {
         })
     }
 
-    /// The budgets this cache was built with.
     pub fn config(&self) -> &TokenizerCacheConfig {
         &self.config
     }
 
-    /// Number of entries currently retained.
     pub fn len(&self) -> usize {
         self.state.lock().lru.len()
     }
 
-    /// Whether the cache holds no entries.
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
 
-    /// Snapshot of counters and occupancy.
     pub fn stats(&self) -> TokenizerCacheStats {
         let (entries, bytes) = {
             let state = self.state.lock();
@@ -301,7 +292,6 @@ impl<K: Hash + Eq, V> EncodeCache<K, V> {
         }
     }
 
-    /// Drop every entry. Counters are kept.
     pub fn clear(&self) {
         let removed = {
             let mut guard = self.state.lock();
@@ -314,7 +304,7 @@ impl<K: Hash + Eq, V> EncodeCache<K, V> {
             publish_occupancy_delta(-(entries as isize), -(bytes as isize));
             removed
         };
-        // Free the entries outside the lock; see the module documentation.
+        // Free entries outside the lock.
         drop(removed);
     }
 
@@ -331,8 +321,7 @@ impl<K: Hash + Eq, V> EncodeCache<K, V> {
 
     fn insert(&self, input: K, encoding: Arc<V>, bytes: usize) {
         let mut evicted: u64 = 0;
-        // Entries removed under the lock are freed after it is released; see
-        // the module documentation. Allocates only when something is removed.
+        // Defer deallocation until after unlocking.
         let mut removed: Vec<(K, CacheEntry<V>)> = Vec::new();
         {
             let mut guard = self.state.lock();
@@ -345,8 +334,7 @@ impl<K: Hash + Eq, V> EncodeCache<K, V> {
                 state.lru.push(input, CacheEntry { encoding, bytes })
             {
                 state.bytes -= old_entry.bytes;
-                // A concurrent miss may have inserted the same key.
-                // Replacing it does not count as an eviction.
+                // Concurrent replacements are not evictions.
                 if !replacing {
                     evicted += 1;
                 }
@@ -354,8 +342,7 @@ impl<K: Hash + Eq, V> EncodeCache<K, V> {
             }
             state.bytes += bytes;
 
-            // `validate()` bounds every stored entry by `max_bytes`, so this
-            // loop never reaches the entry just inserted (the MRU).
+            // Each entry fits max_bytes, so the newest entry survives.
             while state.bytes > self.config.max_bytes {
                 match state.lru.pop_lru() {
                     Some(victim) => {
@@ -394,8 +381,7 @@ impl<K: Hash + Eq, V> EncodeCache<K, V> {
         if let Some(encoding) = self.lookup(input) {
             self.hits.fetch_add(1, Ordering::Relaxed);
             TokenizerMetrics::record_cache_hit();
-            // Clone outside the lock so a large encoding does not stall
-            // other readers.
+            // Clone outside the lock.
             return Ok((*encoding).clone());
         }
         self.misses.fetch_add(1, Ordering::Relaxed);

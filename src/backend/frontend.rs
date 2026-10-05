@@ -52,7 +52,7 @@ impl EngineFrontend {
         }
     }
 
-    /// Opt-in L0 with one entry/byte budget across all loaded models.
+    /// Enable L0 with a shared budget across models.
     pub fn with_tokenizer_cache(
         request_timeout: Duration,
         config: TokenizerCacheConfig,
@@ -70,7 +70,7 @@ impl EngineFrontend {
         }
     }
 
-    /// Aggregate L0 counters and occupancy across loaded models, if enabled.
+    /// L0 stats across models, or None when disabled.
     pub fn tokenizer_cache_stats(&self) -> Option<TokenizerCacheStats> {
         self.tokenizer.encoding_cache_stats()
     }

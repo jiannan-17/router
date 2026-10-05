@@ -1,4 +1,4 @@
-//! Exact encodings shared across the gRPC frontend's loaded models.
+//! Shared L0 encoding cache for gRPC models.
 use std::mem::size_of;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -28,13 +28,13 @@ pub(crate) struct PromptEncoder {
 }
 
 impl PromptEncoder {
-    // The caller must only attach a cache for a deterministic, immutable tokenizer.
+    // Caching requires a deterministic tokenizer with fixed configuration.
     pub(crate) fn new(tokenizer: DynTokenizer, cache: Option<Arc<FrontendCache>>) -> Self {
         static NEXT_INSTANCE: AtomicU64 = AtomicU64::new(0);
         Self {
             tokenizer,
             cache,
-            // Clones keep their namespace; a newly loaded tokenizer never reuses one.
+            // Clones share an ID; new instances get distinct IDs.
             instance: NEXT_INSTANCE.fetch_add(1, Ordering::Relaxed),
         }
     }
@@ -69,8 +69,7 @@ impl PromptEncoder {
     }
 }
 
-/// Upstream's trait does not expose determinism. Inspect the resolved source
-/// once at model load; unknown/unreadable configurations conservatively bypass.
+/// Check source files because the tokenizer trait cannot report determinism.
 pub(crate) async fn deterministic_model(model: &str) -> Result<bool> {
     let files = ResolvedModelFiles::new(model).await?;
     match files.tokenizer {
@@ -85,7 +84,7 @@ pub(crate) async fn deterministic_model(model: &str) -> Result<bool> {
 fn deterministic_hf_model(model: &serde_json::Value) -> bool {
     match model["type"].as_str() {
         Some("BPE") => model["dropout"].is_null() || model["dropout"].as_f64() == Some(0.0),
-        // Their normal encode methods do not sample.
+        // Normal encode does not sample.
         Some("WordPiece" | "WordLevel" | "Unigram") => true,
         _ => false,
     }
@@ -190,7 +189,7 @@ mod tests {
         }
         assert_eq!(inner.calls.load(Ordering::Relaxed), 8);
         assert_eq!(cache.stats().hits, 8);
-        // Even reusing the same tokenizer Arc gets a fresh configuration namespace.
+        // A new encoder must miss, even with the same tokenizer Arc.
         let other = PromptEncoder::new(inner.clone(), Some(cache.clone()));
         encode(&other, "Hello", false);
         assert_eq!(inner.calls.load(Ordering::Relaxed), 9);

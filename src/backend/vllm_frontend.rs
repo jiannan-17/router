@@ -1,6 +1,4 @@
-//! Adapter onto `vllm-chat` + `vllm-tokenizer` + `vllm-text` `Prompt`.
-//! Not a second renderer. `load_model_backends` is what
-//! `TokenizerCache` runs once per model key.
+//! Adapter for `vllm-chat`, `vllm-tokenizer`, and `vllm-text`.
 
 use std::collections::HashMap;
 use std::sync::Arc;

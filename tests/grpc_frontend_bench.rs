@@ -1,4 +1,4 @@
-//! gRPC frontend extension of #290's offline router-overhead methodology.
+//! Offline gRPC frontend benchmark.
 //! cargo test --release --test grpc_frontend_bench -- --ignored --nocapture
 #![cfg(unix)]
 
@@ -40,7 +40,7 @@ fn prompt(size: usize, index: usize) -> String {
 }
 
 fn cpu_seconds() -> f64 {
-    // SAFETY: getrusage initializes the POD rusage struct for this process.
+    // SAFETY: usage is a valid writable rusage pointer.
     let usage = unsafe {
         let mut usage: libc::rusage = std::mem::zeroed();
         assert_eq!(libc::getrusage(libc::RUSAGE_SELF, &mut usage), 0);
@@ -82,8 +82,7 @@ async fn grpc_frontend_l0_overhead() {
                     } else {
                         EngineFrontend::new()
                     });
-                    // Load the model, establish the connection and warm the hot set
-                    // outside measurement. Cold measurement uses disjoint markers.
+                    // Warm up outside measurement; cold requests use different IDs.
                     for i in 0..64 {
                         let request = chat_request(&model, &prompt(size, i), false);
                         let prepared = frontend.prepare(request).await.unwrap();

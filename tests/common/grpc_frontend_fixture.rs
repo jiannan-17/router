@@ -1,4 +1,4 @@
-//! Offline model files shared by the gRPC L0 tests and overhead benchmark.
+//! Local model fixture for gRPC tests and benchmarks.
 #![allow(dead_code)]
 use serde_json::json;
 use tempfile::TempDir;
@@ -8,7 +8,7 @@ pub fn model_fixture() -> TempDir {
     let dir = tempfile::tempdir().unwrap();
     let mut tokenizer: serde_json::Value =
         serde_json::from_str(include_str!("../fixtures/tokenizer/byte_level_bpe.json")).unwrap();
-    // Make add_special_tokens observably change the IDs.
+    // Add BOS so add_special_tokens changes the IDs.
     tokenizer["post_processor"] = json!({
         "type": "TemplateProcessing",
         "single": [{"SpecialToken": {"id": "<s>", "type_id": 0}}, {"Sequence": {"id": "A", "type_id": 0}}],

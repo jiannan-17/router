@@ -1,4 +1,4 @@
-//! Real offline rendering/encoding, mock transport, and existing L0 metrics.
+//! L0 integration tests with local models and a mock gRPC worker.
 mod common;
 #[path = "common/grpc_frontend_fixture.rs"]
 mod fixture;
@@ -31,7 +31,7 @@ fn metric(metrics: &PrometheusHandle, name: &str) -> f64 {
 
 #[tokio::test]
 async fn grpc_frontend_cache_parity_metrics_streaming_and_retries() {
-    // This integration binary has one test, so its recorder and env are isolated.
+    // Keep one test: the recorder and env are process-wide.
     let metrics = PrometheusBuilder::new().install_recorder().unwrap();
     let model = model_fixture();
     let other_model = model_fixture();
@@ -82,7 +82,7 @@ async fn grpc_frontend_cache_parity_metrics_streaming_and_retries() {
         .unwrap();
     assert_eq!(on.tokenizer_cache_stats().unwrap().misses, 4);
 
-    // Validation still happens when a matching encoding is already cached.
+    // Cache hits must not skip validation.
     let before = on.tokenizer_cache_stats().unwrap();
     let mut invalid = request.clone();
     invalid.continue_final_message = true;
@@ -121,7 +121,7 @@ async fn grpc_frontend_cache_parity_metrics_streaming_and_retries() {
     assert_eq!(metric(&metrics, "vllm_tokenizer_cache_bytes"), 0.0);
     assert_eq!(metric(&metrics, "vllm_tokenizer_cache_entries"), 0.0);
 
-    // Stochastic model configuration bypasses L0, even when it is enabled.
+    // BPE dropout must bypass L0.
     let stochastic = model_fixture();
     let path = stochastic.path().join("tokenizer.json");
     let mut config: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
@@ -140,7 +140,7 @@ async fn grpc_frontend_cache_parity_metrics_streaming_and_retries() {
         Default::default()
     );
 
-    // Exercise the router's actual automatic retry loop with a fresh cache.
+    // Retries must reuse prepared tokens.
     std::env::set_var("VLLM_ROUTER_L0_CACHE", "1");
     let config = RouterConfig {
         mode: RoutingMode::Regular {
@@ -197,7 +197,7 @@ async fn grpc_frontend_cache_parity_metrics_streaming_and_retries() {
 
     http_ignores_l0_config(&request).await;
 
-    // Oversized input leaves the small working set intact and reports its skip.
+    // Oversized inputs must preserve cached entries.
     let small = EngineFrontend::with_tokenizer_cache(
         Duration::from_secs(30),
         TokenizerCacheConfig {
@@ -239,7 +239,7 @@ async fn http_ignores_l0_config(request: &vllm_router_rs::protocols::spec::ChatC
     let server = tokio::spawn(async move {
         axum::serve(listener, worker).await.unwrap();
     });
-    // Invalid L0 budgets must not affect an HTTP-only router.
+    // HTTP ignores invalid L0 settings.
     std::env::set_var("VLLM_ROUTER_L0_CACHE", "1");
     std::env::set_var("VLLM_ROUTER_L0_MAX_BYTES", "invalid");
     let config = RouterConfig {

@@ -1,11 +1,5 @@
-//! Chat+tokenize for gRPC workers: **only** `vllm-chat` + `vllm-tokenizer`.
-//!
-//! There is no HuggingFace/minijinja fallback. If those crates are not
-//! linked, `grpc://` is unavailable.
-//!
-//! `TokenizerCache` caches loaded frontend objects (`load_model_backends`),
-//! with an optional, separately bounded L0 cache of rendered-text encodings.
-//! Neither cache stores engine KV.
+//! gRPC chat rendering and tokenization via `vllm-chat` and `vllm-tokenizer`.
+//! Loaded models share an optional L0 encoding cache.
 
 use std::path::Path;
 use std::sync::Arc;
@@ -37,11 +31,7 @@ enum Frontend {
     TestIds(Vec<u32>),
 }
 
-/// In-process cache of loaded `vllm-chat` / `vllm-tokenizer` objects.
-///
-/// First request for a model key calls `load_model_backends`; later
-/// requests clone the `Arc`. An optional L0 encoding cache shares one budget
-/// across these frontends; neither cache stores engine KV.
+/// Loads each model once and optionally shares an L0 budget across models.
 #[derive(Clone)]
 pub struct TokenizerCache {
     pinned: Arc<RwLock<Option<Frontend>>>,
@@ -72,7 +62,7 @@ impl TokenizerCache {
         }
     }
 
-    /// One encoding budget shared by every model resolved through this loader.
+    /// Enable L0 with a shared budget across models.
     pub fn with_encoding_cache(config: TokenizerCacheConfig) -> Result<Self> {
         Ok(Self {
             encoding_cache: Some(Arc::new(FrontendCache::new(config)?)),
@@ -80,7 +70,7 @@ impl TokenizerCache {
         })
     }
 
-    /// Aggregate L0 counters and occupancy across loaded models, if enabled.
+    /// L0 stats across models, or None when disabled.
     pub fn encoding_cache_stats(&self) -> Option<TokenizerCacheStats> {
         self.encoding_cache.as_ref().map(|cache| cache.stats())
     }
