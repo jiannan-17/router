@@ -56,7 +56,7 @@ impl VllmFrontend {
         } else {
             None
         };
-        let encoder = PromptEncoder::new(backends.text_backend.tokenizer(), cache);
+        let encoder = PromptEncoder::new(model_id, backends.text_backend.tokenizer(), cache);
         Ok(Self {
             backends: Arc::new(backends),
             encoder,

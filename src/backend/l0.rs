@@ -1,7 +1,7 @@
 //! Shared L0 encoding cache for gRPC models.
 use std::mem::size_of;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Once};
 
 use anyhow::{bail, Context, Result};
 use vllm_text::backend::hf::{ResolvedModelFiles, TokenizerSource};
@@ -26,17 +26,25 @@ pub(crate) struct PromptEncoder {
     tokenizer: DynTokenizer,
     cache: Option<Arc<FrontendCache>>,
     instance: u64,
+    model_id: Arc<str>,
+    oversized_warning: Arc<Once>,
 }
 
 impl PromptEncoder {
     // Caching requires a deterministic tokenizer with fixed configuration.
-    pub(crate) fn new(tokenizer: DynTokenizer, cache: Option<Arc<FrontendCache>>) -> Self {
+    pub(crate) fn new(
+        model_id: &str,
+        tokenizer: DynTokenizer,
+        cache: Option<Arc<FrontendCache>>,
+    ) -> Self {
         static NEXT_INSTANCE: AtomicU64 = AtomicU64::new(0);
         Self {
             tokenizer,
             cache,
             // Clones share an ID; new instances get distinct IDs.
             instance: NEXT_INSTANCE.fetch_add(1, Ordering::Relaxed),
+            model_id: Arc::from(model_id),
+            oversized_warning: Arc::new(Once::new()),
         }
     }
 
@@ -63,11 +71,22 @@ impl PromptEncoder {
             &key,
             || self.tokenizer.encode(&key.text, add_special_tokens),
             |ids| {
-                entry_overhead_bytes::<EncodingKey, Vec<u32>>()
+                let bytes = entry_overhead_bytes::<EncodingKey, Vec<u32>>()
                     + key.text.len()
                     + key.cache_salt.as_ref().map_or(0, String::len)
                     + size_of::<Vec<u32>>()
-                    + ids.len() * size_of::<u32>()
+                    + ids.len() * size_of::<u32>();
+                if bytes > cache.config().max_entry_bytes {
+                    self.oversized_warning.call_once(|| {
+                        tracing::warn!(
+                            model_id = %self.model_id,
+                            estimated_bytes = bytes,
+                            max_entry_bytes = cache.config().max_entry_bytes,
+                            "L0 entry exceeds cache limit; encoding will not be cached"
+                        );
+                    });
+                }
+                bytes
             },
         )
     }
@@ -184,8 +203,8 @@ mod tests {
     fn hits_skip_encoding_and_isolate_instances_options_and_prompts() {
         let cache = Arc::new(FrontendCache::new(Default::default()).unwrap());
         let inner = CountingTokenizer::new(10);
-        let encoder = PromptEncoder::new(inner.clone(), Some(cache.clone()));
-        let uncached = PromptEncoder::new(CountingTokenizer::new(10), None);
+        let encoder = PromptEncoder::new("test-model", inner.clone(), Some(cache.clone()));
+        let uncached = PromptEncoder::new("test-model", CountingTokenizer::new(10), None);
         for text in ["Hello", "hello", "你好 👋", ""] {
             for special in [false, true] {
                 let expected = encode(&uncached, text, special);
@@ -196,10 +215,14 @@ mod tests {
         assert_eq!(inner.calls.load(Ordering::Relaxed), 8);
         assert_eq!(cache.stats().hits, 8);
         // A new encoder must miss, even with the same tokenizer Arc.
-        let other = PromptEncoder::new(inner.clone(), Some(cache.clone()));
+        let other = PromptEncoder::new("test-model", inner.clone(), Some(cache.clone()));
         encode(&other, "Hello", false);
         assert_eq!(inner.calls.load(Ordering::Relaxed), 9);
-        let changed = PromptEncoder::new(CountingTokenizer::new(20), Some(cache.clone()));
+        let changed = PromptEncoder::new(
+            "test-model",
+            CountingTokenizer::new(20),
+            Some(cache.clone()),
+        );
         assert_ne!(
             encode(&changed, "Hello", false),
             encode(&encoder, "Hello", false)
@@ -211,9 +234,9 @@ mod tests {
     fn cache_salt_isolates_entries_and_counts_retained_bytes() {
         let cache = Arc::new(FrontendCache::new(Default::default()).unwrap());
         let inner = CountingTokenizer::new(0);
-        let encoder = PromptEncoder::new(inner.clone(), Some(cache.clone()));
+        let encoder = PromptEncoder::new("test-model", inner.clone(), Some(cache.clone()));
         let expected = encode(
-            &PromptEncoder::new(CountingTokenizer::new(0), None),
+            &PromptEncoder::new("test-model", CountingTokenizer::new(0), None),
             "Hello",
             false,
         );
@@ -245,7 +268,7 @@ mod tests {
             })
             .unwrap(),
         );
-        let encoder = PromptEncoder::new(inner, Some(small.clone()));
+        let encoder = PromptEncoder::new("test-model", inner, Some(small.clone()));
         assert_eq!(encode(&encoder, "Hello", false), expected);
         assert_eq!(
             encoder
@@ -261,7 +284,7 @@ mod tests {
     fn errors_and_token_ids_are_never_cached() {
         let cache = Arc::new(FrontendCache::new(Default::default()).unwrap());
         let inner = CountingTokenizer::new(0);
-        let encoder = PromptEncoder::new(inner.clone(), Some(cache.clone()));
+        let encoder = PromptEncoder::new("test-model", inner.clone(), Some(cache.clone()));
         for _ in 0..2 {
             assert!(encoder
                 .encode(Prompt::Text("fail".into()), false, None)
@@ -283,7 +306,11 @@ mod tests {
     fn shared_budget_evicts_across_models_and_skips_oversized_inputs() {
         let measure = Arc::new(FrontendCache::new(Default::default()).unwrap());
         encode(
-            &PromptEncoder::new(CountingTokenizer::new(0), Some(measure.clone())),
+            &PromptEncoder::new(
+                "test-model",
+                CountingTokenizer::new(0),
+                Some(measure.clone()),
+            ),
             "a",
             false,
         );
@@ -301,8 +328,10 @@ mod tests {
             },
         ] {
             let cache = Arc::new(FrontendCache::new(config).unwrap());
-            let a = PromptEncoder::new(CountingTokenizer::new(0), Some(cache.clone()));
-            let b = PromptEncoder::new(CountingTokenizer::new(1), Some(cache.clone()));
+            let a =
+                PromptEncoder::new("test-model", CountingTokenizer::new(0), Some(cache.clone()));
+            let b =
+                PromptEncoder::new("test-model", CountingTokenizer::new(1), Some(cache.clone()));
             encode(&a, "a", false);
             encode(&b, "a", false);
             assert_eq!(cache.stats().entries, 1);
@@ -326,8 +355,8 @@ mod tests {
             max_entry_bytes: 1024,
         };
         let cache = Arc::new(FrontendCache::new(config).unwrap());
-        let a = PromptEncoder::new(CountingTokenizer::new(0), Some(cache.clone()));
-        let b = PromptEncoder::new(CountingTokenizer::new(1), Some(cache.clone()));
+        let a = PromptEncoder::new("test-model", CountingTokenizer::new(0), Some(cache.clone()));
+        let b = PromptEncoder::new("test-model", CountingTokenizer::new(1), Some(cache.clone()));
         std::thread::scope(|scope| {
             for t in 0..8 {
                 let encoder = if t % 2 == 0 { a.clone() } else { b.clone() };
